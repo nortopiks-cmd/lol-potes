@@ -1,0 +1,19 @@
+{
+  "cle_api": "",
+  "serveur": "euw1",
+  "region": "europe",
+  "joueurs": [
+    "Nortopik#EUW",
+    "EL D Dino#EUW",
+    "Astaro#Snip",
+    "marcopopo#HNK",
+    "benjo711#EUW",
+    "STY#krd",
+    "Eneiroh#6094",
+    "grrrr#grou"
+  ],
+  "mois": 3,
+  "max_parties_par_joueur": 300,
+  "revues_max": 150,
+  "min_parties_classement": 3
+}
