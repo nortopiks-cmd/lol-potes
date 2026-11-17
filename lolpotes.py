@@ -120,8 +120,12 @@ class Riot:
         else:
             raise RiotError("Trop de tentatives, réessaie plus tard.")
         if cache_name:
+            if cache_name.startswith("m_"):
+                data = compact_match(data)
+            elif cache_name.startswith("t_"):
+                data = compact_timeline(data)
             with open(os.path.join(CACHE, cache_name + ".json"), "w", encoding="utf-8") as f:
-                json.dump(data, f)
+                json.dump(data, f, separators=(",", ":"))
         return data
 
     # endpoints
@@ -186,6 +190,45 @@ def save_lp_history(players):
 
 def month_key(ms):
     return datetime.datetime.fromtimestamp(ms / 1000).strftime("%Y-%m")
+
+
+P_KEYS = ["participantId", "puuid", "riotIdGameName", "summonerName", "championName", "teamId", "win", "teamPosition", "kills", "deaths",
+          "assists", "totalMinionsKilled", "neutralMinionsKilled", "goldEarned", "totalDamageDealtToChampions", "visionScore", "champLevel",
+          "pentaKills", "quadraKills", "tripleKills", "firstBloodKill", "dragonKills", "baronKills", "turretTakedowns", "turretKills",
+          "totalTimeSpentDead", "objectivesStolen", "totalHealsOnTeammates", "totalDamageShieldedOnTeammates", "totalDamageTaken",
+          "wardsPlaced", "profileIcon", "gameEndedInEarlySurrender"] + [f"item{i}" for i in range(7)]
+
+
+def compact_match(m):
+    """Garde seulement ce que le rapport utilise (une partie passe d'environ 60 Ko à 6 Ko)."""
+    if not m or "info" not in m:
+        return m
+    i = m["info"]
+    parts = []
+    for p in i.get("participants", []):
+        q = {k: p[k] for k in P_KEYS if k in p}
+        ch = p.get("challenges") or {}
+        q["challenges"] = {k: ch[k] for k in ("soloKills", "skillshotsDodged") if k in ch}
+        parts.append(q)
+    teams = [{"teamId": t.get("teamId"), "win": t.get("win"), "objectives": t.get("objectives", {})} for t in i.get("teams", [])]
+    return {"metadata": {"matchId": m.get("metadata", {}).get("matchId")},
+            "info": dict({k: i.get(k) for k in ("gameCreation", "gameDuration", "queueId", "gameVersion")}, participants=parts, teams=teams)}
+
+
+def compact_timeline(t):
+    """Garde l'or et le farm minute par minute + les kills, objectifs et bâtiments (environ 1 Mo -> 30 Ko)."""
+    if not t or "info" not in t:
+        return t
+    keep = {"CHAMPION_KILL", "ELITE_MONSTER_KILL", "BUILDING_KILL"}
+    ev_keys = ["type", "timestamp", "killerId", "victimId", "assistingParticipantIds", "position", "monsterType", "monsterSubType",
+               "killerTeamId", "buildingType", "laneType", "teamId"]
+    frames = []
+    for fr in t["info"].get("frames", []):
+        frames.append({"timestamp": fr.get("timestamp"),
+                       "participantFrames": {k: {x: v.get(x, 0) for x in ("totalGold", "minionsKilled", "jungleMinionsKilled")}
+                                             for k, v in fr.get("participantFrames", {}).items()},
+                       "events": [{k: e[k] for k in ev_keys if k in e} for e in fr.get("events", []) if e.get("type") in keep]})
+    return {"info": {"frames": frames}}
 
 
 def ddragon_version():
@@ -367,9 +410,9 @@ def build_report(players, matches, timelines, ddv, months, min_games, demo=False
 
 # --------------------------------------------------------------------------- récupération réelle
 def fetch_all(cfg):
-    key = cfg["cle_api"]
+    key = os.environ.get("RIOT_API_KEY") or cfg.get("cle_api", "")
     if not key or "colle" in key:
-        raise RiotError("Mets ta clé API dans config.json (champ \"cle_api\").")
+        raise RiotError("Mets ta clé API dans config.json (champ \"cle_api\") ou dans le secret RIOT_API_KEY sur GitHub.")
     api = Riot(key, cfg["serveur"], cfg["region"])
     start = month_start(cfg["mois"])
     players = []
@@ -1231,7 +1274,12 @@ render();
 
 # --------------------------------------------------------------------------- programme principal
 def main():
+    global OUT
     demo = "--demo" in sys.argv
+    site = "--site" in sys.argv
+    if site:  # mode GitHub : la page va dans docs/index.html (publiée par GitHub Pages)
+        os.makedirs(os.path.join(HERE, "docs"), exist_ok=True)
+        OUT = os.path.join(HERE, "docs", "index.html")
     try:
         if demo:
             say("Mode démo : données inventées.")
@@ -1249,8 +1297,8 @@ def main():
         with open(OUT, "w", encoding="utf-8") as f:
             f.write(TEMPLATE.replace("__DATA__", payload))
         n = len(data["games"])
-        say(f"✓ rapport.html créé ({n} parties, {sum(1 for g in data['games'] if g['review'])} revues).")
-        if "--no-open" not in sys.argv:
+        say(f"✓ {os.path.relpath(OUT, HERE)} créé ({n} parties, {sum(1 for g in data['games'] if g['review'])} revues).")
+        if "--no-open" not in sys.argv and not site:
             webbrowser.open("file://" + OUT)
         return 0
     except RiotError as e:
@@ -1260,9 +1308,9 @@ def main():
 
 if __name__ == "__main__":
     code = main()
-    if os.name == "nt" and "--no-open" not in sys.argv and not sys.stdin.closed:
+    if os.name == "nt" and "--no-open" not in sys.argv and "--site" not in sys.argv and not sys.stdin.closed:
         try:
             input("\nAppuie sur Entrée pour fermer…")
         except Exception:
             pass
-    sys.exit(code)
+    sys.exit(code if "--site" in sys.argv else 0 if code == 0 else code)
