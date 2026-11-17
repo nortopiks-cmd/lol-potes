@@ -1293,6 +1293,16 @@ def main():
             players, matches, timelines = fetch_all(cfg)
         ddv = ddragon_version()
         data = build_report(players, matches, timelines, ddv, cfg["mois"], cfg["min_parties_classement"], demo)
+        # mode site : si rien n'a changé (pas de nouvelle partie, pas de LP différents), on ne republie pas la page
+        if site and not demo:
+            import hashlib
+            sig = hashlib.sha256(json.dumps({k: v for k, v in data.items() if k != "generated"}, sort_keys=True).encode()).hexdigest()
+            sig_file = os.path.join(HERE, "docs", ".signature")
+            if os.path.exists(sig_file) and open(sig_file).read().strip() == sig and os.path.exists(OUT):
+                say("Rien de nouveau depuis la dernière mise à jour : la page n'est pas republiée.")
+                return 0
+            with open(sig_file, "w") as f:
+                f.write(sig)
         payload = json.dumps(data, ensure_ascii=False).replace("</", "<\\/")
         with open(OUT, "w", encoding="utf-8") as f:
             f.write(TEMPLATE.replace("__DATA__", payload))
