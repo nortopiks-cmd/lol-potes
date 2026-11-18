@@ -35,6 +35,8 @@ DEFAULT_CONFIG = {
     "site_url": "",
     "alertes": {"parties": True, "exploits": True, "series": True, "rangs": True, "joueur_du_mois": True, "en_game": False},
 }
+DEFAULT_POINTS = {"victoire": 3, "defaite": 1, "bonne_partie": 1, "partie_parfaite": 2, "quadra": 2, "penta": 5,
+                  "max_parties_par_jour": 8, "membres_comptes": 10}
 QUEUES = {420: "solo", 440: "flex"}
 QUEUE_NAMES = {420: "Ranked solo/duo", 440: "Ranked flex"}
 
@@ -68,6 +70,15 @@ class Riot:
         self.key, self.platform, self.region = key.strip(), platform, region
         self.calls = collections.deque()
         os.makedirs(CACHE, exist_ok=True)
+        vf = os.path.join(CACHE, "version.txt")
+        if not os.path.exists(vf) or open(vf).read().strip() != CACHE_VERSION:
+            n = 0
+            for f in os.listdir(CACHE):
+                if f.startswith(("m_", "t_")) and f.endswith(".json"):
+                    os.remove(os.path.join(CACHE, f)); n += 1
+            if n:
+                say(f"Nouvelle version des revues : {n} fichiers de cache seront relus (une seule fois, ça peut prendre un moment).")
+            open(vf, "w").write(CACHE_VERSION)
 
     def _wait(self):
         while True:
@@ -175,6 +186,59 @@ TIER_ORDER = ["IRON", "BRONZE", "SILVER", "GOLD", "PLATINUM", "EMERALD", "DIAMON
 DIV_ORDER = {"IV": 0, "III": 1, "II": 2, "I": 3}
 
 
+def roster_ids(cfg):
+    """Tous les Riot ID suivis : liste « joueurs » + membres de chaque structure (sans doublon)."""
+    out, seen = [], set()
+    def add(rid):
+        if rid and rid.lower() not in seen:
+            seen.add(rid.lower()); out.append(rid)
+    for rid in cfg.get("joueurs", []):
+        add(rid)
+    for st in cfg.get("structures", []):
+        for eq in st.get("equipes", []):
+            for j in eq.get("joueurs", []):
+                add(j["riot"] if isinstance(j, dict) else j)
+        for rid in st.get("membres", []):
+            add(rid)
+    return out
+
+
+def structures_payload(cfg, players):
+    """Structures, équipes, matchs et règles de points pour la page (les Riot ID deviennent des identifiants de joueur)."""
+    if not cfg.get("structures"):
+        return {"mode": "potes"}
+    by = {p["rid"].lower(): p["puuid"] for p in players if p.get("rid")}
+    sts = []
+    for st in cfg["structures"]:
+        sid = st.get("id") or st["nom"].lower().replace(" ", "-")
+        members, teams = [], []
+        for eq in st.get("equipes", []):
+            roster = []
+            for j in eq.get("joueurs", []):
+                j = j if isinstance(j, dict) else {"riot": j}
+                pu = by.get(j["riot"].lower())
+                roster.append({"riot": j["riot"], "puuid": pu, "poste": j.get("poste", ""), "role": j.get("role", "titulaire")})
+                if pu and pu not in members:
+                    members.append(pu)
+            teams.append({"nom": eq.get("nom", "Équipe"), "coach": eq.get("coach", ""), "joueurs": roster})
+        for rid in st.get("membres", []):
+            pu = by.get(rid.lower())
+            if pu and pu not in members:
+                members.append(pu)
+        sts.append({"id": sid, "nom": st.get("nom", sid), "tag": st.get("tag", sid[:3].upper()), "logo": st.get("logo", ""),
+                    "couleur": st.get("couleur", "#d4ad62"), "description": st.get("description", ""), "discord": st.get("discord", ""),
+                    "recrutement": st.get("recrutement", False), "reseaux": st.get("reseaux", {}), "equipes": teams, "membres": members,
+                    "postes_recherches": st.get("postes_recherches", []), "niveau": st.get("niveau", ""), "contact": st.get("contact", "")})
+    for p in players:
+        p["structs"] = [s["id"] for s in sts if p["puuid"] in s["membres"]]
+    pts = dict(DEFAULT_POINTS); pts.update(cfg.get("points") or {})
+    allm = cfg.get("matchs", [])
+    return {"mode": "structures", "structures": sts, "points": pts, "ligue": cfg.get("nom_ligue", "La ligue des structures"),
+            "matchs": [m for m in allm if str(m.get("score", "")).strip()],              # résultats
+            "agenda": [m for m in allm if not str(m.get("score", "")).strip()],          # à venir (sans score)
+            "duels": cfg.get("duels", [])}
+
+
 def lp_score(r):
     """Rang converti en nombre : 400 par palier, 100 par division, + LP (Maître et plus : à partir de 2800)."""
     if not r:
@@ -205,7 +269,14 @@ P_KEYS = ["participantId", "puuid", "riotIdGameName", "summonerName", "championN
           "assists", "totalMinionsKilled", "neutralMinionsKilled", "goldEarned", "totalDamageDealtToChampions", "visionScore", "champLevel",
           "pentaKills", "quadraKills", "tripleKills", "firstBloodKill", "dragonKills", "baronKills", "turretTakedowns", "turretKills",
           "totalTimeSpentDead", "objectivesStolen", "totalHealsOnTeammates", "totalDamageShieldedOnTeammates", "totalDamageTaken",
-          "wardsPlaced", "profileIcon", "gameEndedInEarlySurrender"] + [f"item{i}" for i in range(7)]
+          "wardsPlaced", "profileIcon", "gameEndedInEarlySurrender", "visionWardsBoughtInGame", "wardsKilled", "detectorWardsPlaced",
+          "damageDealtToObjectives", "damageDealtToBuildings", "timeCCingOthers", "goldSpent"] + [f"item{i}" for i in range(7)]
+CH_KEYS = ["soloKills", "skillshotsDodged", "skillshotsHit", "controlWardsPlaced", "killParticipation", "teamDamagePercentage",
+           "damageTakenOnTeamPercentage", "turretPlatesTaken", "laneMinionsFirst10Minutes", "jungleCsBefore10Minutes",
+           "maxCsAdvantageOnLaneOpponent", "visionScoreAdvantageLaneOpponent", "earlyLaningPhaseGoldExpAdvantage",
+           "laningPhaseGoldExpAdvantage", "enemyJungleMonsterKills", "killsNearEnemyTurret", "survivedSingleDigitHpCount",
+           "outnumberedKills", "effectiveHealAndShielding", "wardTakedowns", "stealthWardsPlaced", "visionScorePerMinute"]
+CACHE_VERSION = "3"
 
 
 def compact_match(m):
@@ -217,7 +288,7 @@ def compact_match(m):
     for p in i.get("participants", []):
         q = {k: p[k] for k in P_KEYS if k in p}
         ch = p.get("challenges") or {}
-        q["challenges"] = {k: ch[k] for k in ("soloKills", "skillshotsDodged") if k in ch}
+        q["challenges"] = {k: ch[k] for k in CH_KEYS if k in ch}
         parts.append(q)
     teams = [{"teamId": t.get("teamId"), "win": t.get("win"), "objectives": t.get("objectives", {})} for t in i.get("teams", [])]
     return {"metadata": {"matchId": m.get("metadata", {}).get("matchId")},
@@ -228,13 +299,14 @@ def compact_timeline(t):
     """Garde l'or et le farm minute par minute + les kills, objectifs et bâtiments (environ 1 Mo -> 30 Ko)."""
     if not t or "info" not in t:
         return t
-    keep = {"CHAMPION_KILL", "ELITE_MONSTER_KILL", "BUILDING_KILL"}
+    keep = {"CHAMPION_KILL", "ELITE_MONSTER_KILL", "BUILDING_KILL", "ITEM_PURCHASED", "WARD_PLACED", "TURRET_PLATE_DESTROYED"}
     ev_keys = ["type", "timestamp", "killerId", "victimId", "assistingParticipantIds", "position", "monsterType", "monsterSubType",
-               "killerTeamId", "buildingType", "laneType", "teamId"]
+               "killerTeamId", "buildingType", "laneType", "teamId", "participantId", "itemId", "creatorId", "wardType"]
     frames = []
     for fr in t["info"].get("frames", []):
         frames.append({"timestamp": fr.get("timestamp"),
-                       "participantFrames": {k: {x: v.get(x, 0) for x in ("totalGold", "minionsKilled", "jungleMinionsKilled")}
+                       "participantFrames": {k: dict({x: v.get(x, 0) for x in ("totalGold", "minionsKilled", "jungleMinionsKilled", "level", "xp")},
+                                                     position=v.get("position"))
                                              for k, v in fr.get("participantFrames", {}).items()},
                        "events": [{k: e[k] for k in ev_keys if k in e} for e in fr.get("events", []) if e.get("type") in keep]})
     return {"info": {"frames": frames}}
@@ -363,6 +435,7 @@ def review(match, tl, friend_puuids):
         if not deaths:
             tips.append("Aucune mort : propre.")
         friends.append({
+            "coach": coach_game(match, tl, pid) if tl else None,
             "puuid": p["puuid"], "pid": pid, "team": team, "pos": pos,
             "cs10": cs(f10), "csOpp10": cs(o10), "gd10": (f10.get("totalGold", 0) - o10.get("totalGold", 0)) if f10 and o10 else None,
             "gd15": (f15.get("totalGold", 0) - o15.get("totalGold", 0)) if f15 and o15 else None,
@@ -425,7 +498,7 @@ def build_report(players, matches, timelines, ddv, months, min_games, demo=False
     return {
         "generated": int(time.time() * 1000), "months": months, "minGames": min_games, "ddv": ddv, "demo": demo,
         "players": [{"puuid": p["puuid"], "name": p["name"], "tag": p["tag"], "ranks": p.get("ranks", {}), "icon": p.get("icon"),
-                     "lp": p.get("lp", []), "live": p.get("live")} for p in players],
+                     "lp": p.get("lp", []), "live": p.get("live"), "structs": p.get("structs", [])} for p in players],
         "games": games,
     }
 
@@ -440,7 +513,7 @@ def fetch_all(cfg):
     players = []
     acc_cache = os.path.join(CACHE, "comptes.json")
     accs = json.load(open(acc_cache, encoding="utf-8")) if os.path.exists(acc_cache) else {}
-    for rid in cfg["joueurs"]:
+    for rid in roster_ids(cfg):
         if "#" not in rid:
             say(f"⚠ « {rid} » ignoré : il faut le Riot ID complet, ex. Pseudo#EUW")
             continue
@@ -451,7 +524,7 @@ def fetch_all(cfg):
                 say(f"⚠ Compte introuvable : {rid}")
                 continue
             accs[rid.lower()] = a["puuid"]
-        players.append({"name": name, "tag": tag, "puuid": accs[rid.lower()]})
+        players.append({"name": name, "tag": tag, "puuid": accs[rid.lower()], "rid": rid})
     json.dump(accs, open(acc_cache, "w", encoding="utf-8"))
     if not players:
         raise RiotError("Aucun joueur valide dans config.json.")
@@ -503,21 +576,23 @@ DEMO_CHAMPS = ["Darius", "Garen", "Ahri", "LeeSin", "Jinx", "Thresh", "Yasuo", "
 POS = ["TOP", "JUNGLE", "MIDDLE", "BOTTOM", "UTILITY"]
 
 
-def demo_data(cfg):
+def demo_data(cfg, names=None):
     rnd = random.Random(7)
-    names = ["Toi", "Kevin", "Sarah", "Mehdi", "Lucas"]
+    names = names or ["Toi", "Kevin", "Sarah", "Mehdi", "Lucas"]
     players = [{"name": n, "tag": "EUW", "puuid": "demo-" + n, "icon": 29 + i,
                 "ranks": {"solo": {"tier": t, "div": d, "lp": rnd.randint(0, 99), "w": 40, "l": 38},
                           "flex": {"tier": t2, "div": "II", "lp": rnd.randint(0, 99), "w": 12, "l": 10}}}
-               for i, (n, t, d, t2) in enumerate(zip(names, ["GOLD", "PLATINUM", "SILVER", "GOLD", "EMERALD"],
-                                                     ["II", "IV", "I", "III", "IV"], ["SILVER", "GOLD", "GOLD", "PLATINUM", "GOLD"]))]
-    skill = {p["puuid"]: 0.5 + i * 0.12 for i, p in enumerate(players)}
+               for i, (n, t, d, t2) in enumerate(zip(names, (["GOLD", "PLATINUM", "SILVER", "GOLD", "EMERALD", "DIAMOND", "SILVER"] * 4)[:len(names)],
+                                                     (["II", "IV", "I", "III", "IV", "IV", "II"] * 4)[:len(names)], (["SILVER", "GOLD", "GOLD", "PLATINUM", "GOLD"] * 5)[:len(names)]))]
+    for p in players:
+        p["rid"] = p["name"] + "#EUW"
+    skill = {p["puuid"]: 0.5 + (i % 6) * 0.1 for i, p in enumerate(players)}
     matches, timelines = {}, {}
     now = int(time.time() * 1000)
-    for g in range(84):
+    for g in range(84 if len(names) <= 5 else 160):
         qid = 420 if g % 3 else 440
         mid = f"EUW1_{7000000000 + g}"
-        group = rnd.sample(players, 1 if qid == 420 and rnd.random() < .6 else (2 if qid == 420 else rnd.randint(3, 5)))
+        group = rnd.sample(players, 1 if qid == 420 and rnd.random() < .6 else (2 if qid == 420 else rnd.randint(3, min(5, len(players)))))
         dur = rnd.randint(1250, 2250)
         win100 = rnd.random() < 0.5 + 0.08 * (sum(skill[p["puuid"]] for p in group) / len(group) - 0.7)
         parts = []
@@ -548,8 +623,9 @@ def demo_data(cfg):
                        "objectivesStolen": 1 if rnd.random() < .03 else 0, "totalHealsOnTeammates": rnd.randint(0, 6000) if pp["teamPosition"] == "UTILITY" else rnd.randint(0, 600),
                        "totalDamageShieldedOnTeammates": rnd.randint(0, 5000) if pp["teamPosition"] == "UTILITY" else 0,
                        "totalDamageTaken": int(dur / 60 * rnd.uniform(700, 1500)), "wardsPlaced": rnd.randint(5, 40),
-                       "challenges": {"soloKills": rnd.randint(0, 4), "skillshotsDodged": rnd.randint(5, 90)}})
-        matches[mid] = {"metadata": {"matchId": mid}, "info": {"gameCreation": now - g * 26 * 3600 * 1000, "gameDuration": dur, "queueId": qid,
+                       "challenges": {"soloKills": rnd.randint(0, 4), "skillshotsDodged": rnd.randint(5, 90), "controlWardsPlaced": rnd.randint(0, 6),
+                                      "killParticipation": rnd.uniform(.3, .8), "teamDamagePercentage": rnd.uniform(.12, .34), "turretPlatesTaken": rnd.randint(0, 3)}})
+        matches[mid] = {"metadata": {"matchId": mid}, "info": {"gameCreation": now - g * (26 if len(names) <= 5 else 14) * 3600 * 1000, "gameDuration": dur, "queueId": qid,
                                                                "gameVersion": "25.22.1", "participants": parts, "teams": teams}}
         # timeline
         frames, lead = [], 0
@@ -573,8 +649,15 @@ def demo_data(cfg):
                 ev.append({"type": "ELITE_MONSTER_KILL", "timestamp": minute * 60000, "monsterType": "BARON_NASHOR", "killerTeamId": 100 if win100 else 200})
             if minute in (14, 17, 23, 27):
                 ev.append({"type": "BUILDING_KILL", "timestamp": minute * 60000, "buildingType": "TOWER_BUILDING", "laneType": rnd.choice(["TOP_LANE", "MID_LANE", "BOT_LANE"]), "teamId": 200 if win100 else 100})
+            if minute in (11, 13, 15, 17, 19):
+                for pid in tot:
+                    if rnd.random() < .35:
+                        ev.append({"type": "ITEM_PURCHASED", "timestamp": minute * 60000 + 5000, "participantId": pid, "itemId": rnd.choice([3078, 6692, 3071, 3031])})
+            LANES = {"TOP": (1800, 12500), "JUNGLE": (5000, 9000), "MIDDLE": (7400, 7400), "BOTTOM": (12500, 1800), "UTILITY": (12000, 2400)}
             frames.append({"timestamp": minute * 60000, "events": ev,
-                           "participantFrames": {str(pid): {"totalGold": int(tot[pid]), "minionsKilled": csf[pid], "jungleMinionsKilled": 0} for pid in tot}})
+                           "participantFrames": {str(pid): {"totalGold": int(tot[pid]), "minionsKilled": csf[pid], "jungleMinionsKilled": 0,
+                                                            "level": min(18, 1 + minute // 2), "position": {"x": int(rnd.gauss(LANES[parts[pid - 1]["teamPosition"]][0], 2200)),
+                                                                                                         "y": int(rnd.gauss(LANES[parts[pid - 1]["teamPosition"]][1], 2200))}} for pid in tot}})
         timelines[mid] = {"info": {"frames": frames}}
     players[1]["live"] = {"champ": "Darius", "queue": 420, "start": int(time.time() * 1000) - 9 * 60000, "mode": "Ranked solo/duo"}
     # historique de LP inventé (un point par jour)
@@ -586,6 +669,299 @@ def demo_data(cfg):
             s += rnd.randint(-25, 30); f += rnd.randint(-20, 24) if dd % 3 == 0 else 0
             p["lp"].append([now - dd * day, max(0, s), max(0, f)])
     return players, matches, timelines
+
+
+def demo_structures_config():
+    """Ligue d'exemple : 3 structures, équipes, matchs (noms inventés)."""
+    S = lambda *n: [f"{x}#EUW" for x in n]
+    return dict(DEFAULT_CONFIG, joueurs=[], nom_ligue="La ligue des structures", min_parties_classement=3, structures=[
+        {"id": "nexus", "nom": "Nexus Gaming", "tag": "NXS", "couleur": "#3cc7bf", "recrutement": True,
+         "postes_recherches": ["JUNGLE", "UTILITY"], "niveau": "Platine et plus", "contact": "MP Kairo sur Discord",
+         "description": "Structure compétitive et chill, entraînements le mardi et le jeudi.", "discord": "https://discord.gg/exemple",
+         "reseaux": {"Twitter": "https://twitter.com/exemple"},
+         "equipes": [{"nom": "Nexus Prime", "coach": "Coach Max", "joueurs": [
+             {"riot": "Kairo#EUW", "poste": "TOP"}, {"riot": "Vexa#EUW", "poste": "JUNGLE"}, {"riot": "Lumen#EUW", "poste": "MIDDLE"},
+             {"riot": "Tyr#EUW", "poste": "BOTTOM"}, {"riot": "Sola#EUW", "poste": "UTILITY"}, {"riot": "Brix#EUW", "poste": "TOP", "role": "remplaçant"}]}],
+         "membres": S("Nox", "Rivo")},
+        {"id": "phoenix", "nom": "Phoenix Rising", "tag": "PHX", "couleur": "#e2786f", "recrutement": False,
+         "description": "On renaît de nos cendres à chaque saison.", "discord": "https://discord.gg/exemple2",
+         "equipes": [{"nom": "Phoenix Rouge", "coach": "", "joueurs": [
+             {"riot": "Ember#EUW", "poste": "TOP"}, {"riot": "Ash#EUW", "poste": "JUNGLE"}, {"riot": "Pyra#EUW", "poste": "MIDDLE"},
+             {"riot": "Cendre#EUW", "poste": "BOTTOM"}, {"riot": "Flamme#EUW", "poste": "UTILITY"}]}], "membres": S("Brasier")},
+        {"id": "atlas", "nom": "Atlas Esport", "tag": "ATL", "couleur": "#a98bff", "recrutement": True,
+         "postes_recherches": ["TOP", "MIDDLE", "BOTTOM"], "niveau": "Tous niveaux", "contact": "Salon #recrutement",
+         "description": "Structure d'entraide pour progresser ensemble, tous niveaux.", "discord": "https://discord.gg/exemple3",
+         "equipes": [{"nom": "Atlas", "coach": "Mira", "joueurs": [
+             {"riot": "Orion#EUW", "poste": "TOP"}, {"riot": "Vega#EUW", "poste": "JUNGLE"}, {"riot": "Rigel#EUW", "poste": "MIDDLE"},
+             {"riot": "Deneb#EUW", "poste": "BOTTOM"}, {"riot": "Altair#EUW", "poste": "UTILITY"}]}], "membres": []},
+    ], matchs=[
+        {"date": "2026-11-12", "a": "nexus", "b": "phoenix", "score": "2-1", "type": "Scrim BO3"},
+        {"date": "2026-11-08", "a": "atlas", "b": "nexus", "score": "1-0", "type": "Officiel"},
+        {"date": "2026-10-30", "a": "phoenix", "b": "atlas", "score": "2-0", "type": "Scrim BO3"},
+        {"date": (datetime.date.today() + datetime.timedelta(days=1)).isoformat(), "heure": "21:00", "a": "nexus", "b": "atlas", "type": "Scrim BO3"},
+        {"date": (datetime.date.today() + datetime.timedelta(days=6)).isoformat(), "heure": "20:30", "a": "phoenix", "b": "nexus", "type": "Officiel BO5", "note": "Finale de la coupe d'automne"},
+    ], duels=[
+        {"a": "nexus", "b": "phoenix", "debut": (datetime.date.today() - datetime.timedelta(days=4)).isoformat(),
+         "fin": (datetime.date.today() + datetime.timedelta(days=3)).isoformat(), "titre": "Le choc de la semaine"},
+        {"a": "atlas", "b": "phoenix", "debut": (datetime.date.today() - datetime.timedelta(days=20)).isoformat(),
+         "fin": (datetime.date.today() - datetime.timedelta(days=13)).isoformat(), "titre": "Duel d'octobre"},
+    ])
+
+
+# --------------------------------------------------------------------------- le coach : analyse concrète d'une partie
+# Objectifs par poste (niveau Or-Platine environ). Ils servent de repères, pas de vérité absolue.
+TARGETS = {
+    "TOP":     {"cs10": 70, "vpm": 0.7, "cw": 2, "kp": 45, "d14": 2, "share": 22},
+    "JUNGLE":  {"cs10": 60, "vpm": 1.0, "cw": 3, "kp": 60, "d14": 2, "share": 18},
+    "MIDDLE":  {"cs10": 72, "vpm": 0.7, "cw": 2, "kp": 55, "d14": 2, "share": 25},
+    "BOTTOM":  {"cs10": 75, "vpm": 0.6, "cw": 1, "kp": 55, "d14": 2, "share": 25},
+    "UTILITY": {"cs10": None, "vpm": 2.0, "cw": 4, "kp": 60, "d14": 2, "share": 10},
+}
+ROLE_FR = {"TOP": "top", "JUNGLE": "jungle", "MIDDLE": "mid", "BOTTOM": "ADC", "UTILITY": "support"}
+LEGENDARY = set()      # objets « finis » (rempli au lancement depuis Data Dragon)
+MAP = 14800
+
+
+def legendary_items(ddv):
+    try:
+        with urllib.request.urlopen(f"https://ddragon.leagueoflegends.com/cdn/{ddv}/data/en_US/item.json", timeout=10) as r:
+            data = json.loads(r.read().decode())["data"]
+        return {int(i) for i, it in data.items() if it.get("gold", {}).get("total", 0) >= 2200 and not it.get("into")
+                and "Boots" not in it.get("tags", []) and it.get("maps", {}).get("11")}
+    except Exception:
+        return set()
+
+
+def zone_of(x, y, team):
+    """Zone de la carte (approximative) depuis les coordonnées d'un événement."""
+    if x is None or y is None:
+        return None
+    blue = x + y < MAP
+    mine = blue if team == 100 else not blue
+    if x + y < 5200:
+        return "ta base" if team == 100 else "base adverse"
+    if x + y > 2 * MAP - 5200:
+        return "base adverse" if team == 100 else "ta base"
+    if x < 2600 or y > 12200:
+        return "lane top"
+    if y < 2600 or x > 12200:
+        return "lane bot"
+    if abs(x - y) < 1700:
+        return "lane mid"
+    if abs(x + y - MAP) < 1700:
+        return "rivière"
+    return "ta jungle" if mine else "jungle adverse"
+
+
+def mmss(t):
+    return f"{int(t)}:{int(round((t % 1) * 60)):02d}"
+
+
+def fr_n(x, d=0):
+    s = f"{x:,.{d}f}".replace(",", " ").replace(".", ",")
+    return s
+
+
+def coach_game(match, tl, pid):
+    """Analyse d'une partie pour un joueur : points forts, axes de travail chiffrés, moments à revoir, exercice."""
+    info = match["info"]
+    parts = info["participants"]
+    by = {p["participantId"]: p for p in parts}
+    me = by[pid]
+    team, pos = me["teamId"], me.get("teamPosition") or ""
+    T = TARGETS.get(pos, TARGETS["MIDDLE"])
+    minutes = info["gameDuration"] / 60
+    ch = me.get("challenges") or {}
+    frames = tl["info"]["frames"] if tl else []
+    opp = next((o for o in parts if o["teamId"] != team and pos and o.get("teamPosition") == pos), None)
+
+    def fr(minute, who):
+        if not frames or minute >= len(frames):
+            return None
+        return frames[minute].get("participantFrames", {}).get(str(who))
+
+    def cs(f):
+        return (f.get("minionsKilled", 0) + f.get("jungleMinionsKilled", 0)) if f else None
+
+    # ---------- mesures
+    cs10 = cs(fr(10, pid))
+    gd = {m: (fr(m, pid)["totalGold"] - fr(m, opp["participantId"])["totalGold"]) if opp and fr(m, pid) and fr(m, opp["participantId"]) else None
+          for m in (10, 15, 20)}
+    lvd15 = (fr(15, pid).get("level", 0) - fr(15, opp["participantId"]).get("level", 0)) if opp and fr(15, pid) and fr(15, opp["participantId"]) else None
+    lane_curve = []
+    if opp:
+        for m in range(1, min(len(frames), 26)):
+            a, b = fr(m, pid), fr(m, opp["participantId"])
+            if a and b:
+                lane_curve.append((m, a["totalGold"] - b["totalGold"]))
+    vpm = me["visionScore"] / max(1, minutes)
+    cw = ch.get("controlWardsPlaced")
+    if cw is None:
+        cw = me.get("visionWardsBoughtInGame")
+    kp = (ch.get("killParticipation") or 0) * 100 if "killParticipation" in ch else None
+    share = (ch.get("teamDamagePercentage") or 0) * 100 if "teamDamagePercentage" in ch else None
+    plates = ch.get("turretPlatesTaken")
+    first_item = None
+    events = [e for f in frames for e in f.get("events", [])]
+    if LEGENDARY:
+        buys = [e["timestamp"] / 60000 for e in events if e.get("type") == "ITEM_PURCHASED" and e.get("participantId") == pid and e.get("itemId") in LEGENDARY]
+        first_item = min(buys) if buys else None
+
+    # morts : quand, où, seul ou pas, et ce que l'adversaire a pris juste après
+    deaths = []
+    for e in events:
+        if e.get("type") != "CHAMPION_KILL" or e.get("victimId") != pid:
+            continue
+        t = e["timestamp"] / 60000
+        p = e.get("position") or {}
+        z = zone_of(p.get("x"), p.get("y"), team)
+        alone = None
+        if p.get("x") is not None and frames:
+            f = frames[min(len(frames) - 1, int(round(t)))].get("participantFrames", {})
+            dist = []
+            for k, v in f.items():
+                k = int(k)
+                if k != pid and by.get(k, {}).get("teamId") == team and v.get("position"):
+                    dist.append(math.hypot(v["position"]["x"] - p["x"], v["position"]["y"] - p["y"]))
+            alone = bool(dist) and min(dist) > 2800
+        lost = None
+        for o in events:
+            ot = o.get("timestamp", 0) / 60000
+            if 0 <= ot - t <= 1.5 and o.get("type") == "ELITE_MONSTER_KILL" and o.get("killerTeamId") not in (None, team):
+                lost = MONSTERS.get(o.get("monsterType"), "un objectif"); break
+            if 0 <= ot - t <= 1.0 and o.get("type") == "BUILDING_KILL" and o.get("teamId") == team:
+                lost = "un inhibiteur" if o.get("buildingType") == "INHIBITOR_BUILDING" else "une tour"
+        deaths.append({"t": t, "zone": z, "alone": alone, "lost": lost, "killers": 1 + len(e.get("assistingParticipantIds", []))})
+    d14 = sum(1 for d in deaths if d["t"] < 14)
+    alone_n = sum(1 for d in deaths if d["alone"])
+    enemy_jg = sum(1 for d in deaths if d["zone"] == "jungle adverse")
+    cost = [d for d in deaths if d["lost"]]
+
+    # ---------- axes de travail (classés par importance)
+    work, good, moments = [], [], []
+
+    def add(key, sev, title, detail, val=None, target=None, unit=""):
+        work.append({"key": key, "sev": sev, "title": title, "detail": detail, "val": val, "target": target, "unit": unit})
+
+    if d14 > T["d14"]:
+        add("early_deaths", 3 + d14 - T["d14"], f"{d14} morts avant 14 min",
+            f"Objectif : {T['d14']} au maximum. Chaque mort en début de partie donne environ 300 or et de l'XP à l'adversaire, et te fait rater une ou deux vagues.",
+            d14, T["d14"])
+    if alone_n >= 2:
+        add("isolated", 2 + alone_n, f"{alone_n} morts loin de ton équipe",
+            "Aucun allié à proximité au moment de ces morts. Avant d'avancer seul (side lane, jungle adverse), regarde où sont les ennemis sur la minimap : s'il en manque 2 ou plus, recule.",
+            alone_n, 1)
+    if enemy_jg >= 2:
+        add("enemy_jungle", 2 + enemy_jg, f"{enemy_jg} morts dans la jungle adverse",
+            "Entre dans la jungle adverse seulement avec ton jungler ou ton mid, ou après y avoir posé une balise.", enemy_jg, 0)
+    if cost:
+        add("costly_deaths", 2 + 2 * len(cost), f"{len(cost)} mort{'s' if len(cost) > 1 else ''} qui {'ont' if len(cost) > 1 else 'a'} coûté un objectif",
+            " ".join(f"À {mmss(d['t'])}, ta mort a laissé {d['lost']} à l'adversaire." for d in cost[:3]) +
+            " Quand un objectif apparaît dans moins d'une minute, joue en sécurité et place-toi avec ton équipe.", len(cost), 0)
+    if T["cs10"] and cs10 is not None and cs10 < T["cs10"] - 8:
+        miss = T["cs10"] - cs10
+        add("cs", 2 + miss / 10, f"{cs10} CS à 10 min",
+            f"Objectif : {T['cs10']}. Il te manque {miss} sbires, soit environ {fr_n(miss * 21)} or. En entraînement, joue une partie sans chercher les échanges, juste pour viser {T['cs10'] + 10} CS à 10 min.",
+            cs10, T["cs10"])
+    if gd[15] is not None and gd[15] <= -800 and pos != "UTILITY":
+        lv = f" et {abs(lvd15)} niveau{'x' if abs(lvd15) > 1 else ''} de retard" if lvd15 and lvd15 < 0 else ""
+        add("lane_lost", 2 + abs(gd[15]) / 800, f"Lane perdue : {fr_n(gd[15])} or à 15 min",
+            f"Face à {opp['championName']}{lv}. Si la lane est dure, joue près de ta tour, demande de l'aide à ton jungler, et prends l'or que tu peux sans te mettre en danger.",
+            gd[15], 0, " or")
+    if lane_curve:
+        peak_m, peak = max(lane_curve, key=lambda x: x[1])
+        last_m, last = lane_curve[-1]
+        if peak >= 1000 and last <= peak - 1500 and last_m > peak_m:
+            add("lead_thrown", 3 + (peak - last) / 1000, f"Avance gâchée : +{fr_n(peak)} or à {peak_m} min, {fr_n(last)} à {last_m} min",
+                "Après avoir gagné ta lane, transforme ton avance : prends les plaques de tour, aide pour les dragons, et évite les combats en infériorité numérique.",
+                last, peak, " or")
+            moments.append({"t": peak_m, "txt": f"Pic d'avance sur {opp['championName']} : +{fr_n(peak)} or. À partir d'ici, l'avance fond."})
+    if vpm < T["vpm"] - 0.25:
+        add("vision", 1 + (T["vpm"] - vpm) * 3, f"Vision : {fr_n(vpm, 1)} par minute",
+            f"Objectif pour un {ROLE_FR.get(pos, 'joueur')} : {fr_n(T['vpm'], 1)}. Pose ta balise jaune dès qu'elle est prête, et pense à la lentille de balayage en milieu de partie.",
+            round(vpm, 2), T["vpm"])
+    if cw is not None and minutes > 18 and cw < T["cw"]:
+        add("control_wards", 1 + T["cw"] - cw, f"{cw} balise{'s' if cw > 1 else ''} de contrôle posée{'s' if cw > 1 else ''}",
+            f"Objectif : {T['cw']} par partie au moins. Achète-en une à chaque retour en base (75 or) et pose-la près du prochain objectif.",
+            cw, T["cw"])
+    if kp is not None and minutes > 15 and kp < T["kp"] - 15:
+        add("kp", 1 + (T["kp"] - kp) / 10, f"Participation aux kills : {fr_n(kp)} %",
+            f"Objectif : {T['kp']} %. Quand ton équipe se regroupe pour un objectif, rejoins-la au lieu de rester seul à farmer.",
+            round(kp), T["kp"], " %")
+    if share is not None and pos in ("MIDDLE", "BOTTOM") and minutes > 20 and share < T["share"] - 8:
+        add("damage", 1 + (T["share"] - share) / 5, f"{fr_n(share)} % des dégâts de l'équipe",
+            f"Objectif pour un {ROLE_FR[pos]} : {T['share']} % ou plus. En combat, place-toi pour taper la cible la plus proche sans risquer ta vie.",
+            round(share), T["share"], " %")
+    if first_item and pos != "UTILITY" and first_item > 15.5:
+        add("first_item", 1 + (first_item - 14) / 2, f"Premier objet fini à {mmss(first_item)}",
+            "Repère : vers 12-14 min. Récupère les vagues qui arrivent sur ta lane et rentre en base avec assez d'or pour un gros composant.",
+            round(first_item, 1), 14, " min")
+    if plates is not None and pos in ("TOP", "MIDDLE", "BOTTOM") and gd[15] is not None and gd[15] >= 500 and plates == 0:
+        add("plates", 1.5, "Lane gagnée mais aucune plaque de tour",
+            "Une plaque vaut 125 or (jusqu'à 14 min). Quand ton adversaire rentre en base ou meurt, frappe sa tour.", 0, 2)
+
+    # ---------- points forts
+    if T["cs10"] and cs10 is not None and cs10 >= T["cs10"] + 5:
+        good.append(f"Très bon farm : {cs10} CS à 10 min (objectif {T['cs10']}).")
+    if deaths and d14 == 0 and minutes > 16 or not deaths:
+        good.append("Aucune mort en début de partie : début de partie propre." if deaths else "Aucune mort de la partie.")
+    if gd[15] is not None and gd[15] >= 800 and opp:
+        good.append(f"Lane gagnée : +{fr_n(gd[15])} or face à {opp['championName']} à 15 min.")
+    if vpm >= T["vpm"] + 0.3:
+        good.append(f"Bonne vision : {fr_n(vpm, 1)} par minute (objectif {fr_n(T['vpm'], 1)}).")
+    if kp is not None and kp >= T["kp"] + 10:
+        good.append(f"Toujours présent dans les combats : {fr_n(kp)} % de participation aux kills.")
+    if ch.get("soloKills", 0) >= 2:
+        good.append(f"{ch['soloKills']} kills en solo.")
+    if share is not None and share >= 30 and pos != "UTILITY":
+        good.append(f"Gros carry : {fr_n(share)} % des dégâts de l'équipe.")
+    if first_item and first_item <= 12.5 and pos != "UTILITY":
+        good.append(f"Premier objet rapide ({mmss(first_item)}).")
+    if ch.get("skillshotsDodged", 0) >= 40:
+        good.append(f"{ch['skillshotsDodged']} sorts esquivés.")
+
+    # ---------- moments à revoir (minutage pour retrouver l'action dans le replay)
+    for d in deaths:
+        why = []
+        if d["zone"]:
+            why.append(d["zone"])
+        if d["alone"]:
+            why.append("sans allié proche")
+        if d["killers"] >= 3:
+            why.append(f"contre {d['killers']} ennemis")
+        if d["lost"]:
+            why.append(f"l'adversaire prend {d['lost']} juste après")
+        if d["t"] < 14 or d["alone"] or d["lost"]:
+            moments.append({"t": round(d["t"], 2), "txt": "Mort" + (f" ({', '.join(why)})" if why else "")})
+    moments.sort(key=lambda m: m["t"])
+
+    work.sort(key=lambda w: -w["sev"])
+    DRILLS = {
+        "early_deaths": "Prochaine partie : objectif 0 mort avant 10 min. Si tu ne vois pas le jungler adverse sur la carte, joue comme s'il était dans le buisson à côté de toi.",
+        "isolated": "Prochaine partie : avant chaque action seul, compte les ennemis visibles sur la minimap. S'il en manque deux, recule d'abord.",
+        "enemy_jungle": "Prochaine partie : n'entre jamais dans la jungle adverse sans balise ou sans un allié à côté.",
+        "costly_deaths": "Prochaine partie : 60 secondes avant chaque dragon ou Baron, arrête de prendre des risques et va te placer avec ton équipe.",
+        "cs": "En normale ou en entraînement : une partie entière concentrée sur le farm. Vise 80 CS à 10 min, même sans tuer personne.",
+        "lane_lost": "Prochaine partie : regarde le matchup avant le lancement (pic de puissance de l'adversaire) et joue autour de ta tour pendant ses moments forts.",
+        "lead_thrown": "Prochaine partie : quand tu as de l'avance, chaque retour en base doit être suivi d'un objectif (plaques, dragon, Héraut), pas d'un combat au hasard.",
+        "vision": "Prochaine partie : pose ta balise jaune à chaque fois qu'elle est prête, et achète une balise de contrôle à chaque retour.",
+        "control_wards": "Prochaine partie : une balise de contrôle dans ton inventaire en permanence.",
+        "kp": "Prochaine partie : à chaque dragon ou Baron, sois sur place 30 secondes avant l'apparition.",
+        "damage": "Prochaine partie : en combat, tape la cible la plus proche plutôt que de chercher le carry adverse.",
+        "first_item": "Prochaine partie : note ton premier objet fini, et vise 13 min.",
+        "plates": "Prochaine partie : à chaque mort ou retour en base de ton adversaire, va frapper sa tour.",
+    }
+    score = game_score(me, sum(p["kills"] for p in parts if p["teamId"] == team),
+                       sum(p["totalDamageDealtToChampions"] for p in parts if p["teamId"] == team), minutes)
+    grade = "S" if score >= 8.5 else "A" if score >= 7.5 else "B" if score >= 6.5 else "C" if score >= 5.5 else "D"
+    zones = collections.Counter(d["zone"] for d in deaths if d["zone"])
+    return {
+        "grade": grade, "good": good[:4], "work": work[:4], "moments": moments[:8],
+        "drill": DRILLS.get(work[0]["key"]) if work else "Belle partie : garde les mêmes habitudes et vise une note encore plus haute.",
+        "m": {"cs10": cs10, "cs10t": T["cs10"], "vpm": round(vpm, 2), "vpmt": T["vpm"], "cw": cw, "cwt": T["cw"], "d14": d14,
+              "alone": alone_n, "kp": round(kp) if kp is not None else None, "kpt": T["kp"], "gd15": gd[15], "first": round(first_item, 1) if first_item else None,
+              "zones": dict(zones), "deaths": len(deaths), "costly": len(cost), "keys": [w["key"] for w in work]},
+    }
 
 
 # --------------------------------------------------------------------------- alertes Discord
@@ -607,10 +983,13 @@ def rank_txt(r):
     return t if r["tier"] in ("MASTER", "GRANDMASTER", "CHALLENGER") else f"{t} {r.get('div', '')}"
 
 
+BOT_NAME = ["LoL Potes"]
+
+
 def post_discord(url, embeds, site_url=""):
     """Envoie les messages par paquets de 10 encarts (limite Discord)."""
     for i in range(0, len(embeds), 10):
-        body = json.dumps({"username": "LoL Potes", "embeds": embeds[i:i + 10]}).encode("utf-8")
+        body = json.dumps({"username": BOT_NAME[0], "embeds": embeds[i:i + 10]}).encode("utf-8")
         req = urllib.request.Request(url, data=body, method="POST",
                                      headers={"Content-Type": "application/json", "User-Agent": "DiscordBot (lolpotes, 1.0)"})
         for attempt in range(3):
@@ -630,13 +1009,13 @@ def post_discord(url, embeds, site_url=""):
     return True
 
 
-def month_mvp(games, month, q, min_games, names):
+def month_mvp(games, month, q, min_games, names, isf=lambda p: p["friend"]):
     agg = {}
     for g in games:
         if g["month"] != month or g["q"] != q:
             continue
         for p in g["parts"]:
-            if p["friend"]:
+            if isf(p):
                 a = agg.setdefault(p["puuid"], [0, 0.0, 0])
                 a[0] += 1; a[1] += p["score"]; a[2] += 1 if p["win"] else 0
     ranked = [(pu, a[1] / a[0], a[0], a[2]) for pu, a in agg.items() if a[0] >= min_games]
@@ -644,10 +1023,42 @@ def month_mvp(games, month, q, min_games, names):
     return ranked[:3]
 
 
-def discord_alerts(cfg, players, data, webhook):
-    """Compare avec l'état mémorisé au passage précédent et poste les nouveautés sur Discord."""
+def struct_points(data, month):
+    """Points du mois par structure (même calcul que la page) : victoire/défaite + bonus, plafond par jour, meilleurs membres."""
+    R = data.get("points") or DEFAULT_POINTS
+    out = []
+    for st in data.get("structures", []):
+        mem = set(st["membres"]); per = {}
+        for g in sorted(data["games"], key=lambda g: g["date"]):
+            if g["month"] != month:
+                continue
+            day = datetime.datetime.fromtimestamp(g["date"] / 1000).strftime("%Y-%m-%d")
+            for p in g["parts"]:
+                if not p["friend"] or p["puuid"] not in mem:
+                    continue
+                a = per.setdefault(p["puuid"], {"pts": 0, "n": 0, "w": 0, "days": {}})
+                if a["days"].get(day, 0) >= R["max_parties_par_jour"]:
+                    continue
+                a["days"][day] = a["days"].get(day, 0) + 1
+                v = R["victoire"] if p["win"] else R["defaite"]
+                if p["score"] >= 8: v += R["bonne_partie"]
+                if p["d"] == 0 and p["k"] + p["a"] >= 10: v += R["partie_parfaite"]
+                v += p.get("penta", 0) * R["penta"] + p.get("quadra", 0) * R["quadra"]
+                a["pts"] += v; a["n"] += 1; a["w"] += 1 if p["win"] else 0
+        top = sorted(per.values(), key=lambda a: -a["pts"])[:R["membres_comptes"]]
+        out.append({"st": st, "pts": sum(a["pts"] for a in top), "n": sum(a["n"] for a in per.values()), "w": sum(a["w"] for a in per.values())})
+    return sorted(out, key=lambda x: -x["pts"])
+
+
+def discord_alerts(cfg, players, data, webhook, scope=None, state_name="etat_alertes.json", only=None, league=False, title=""):
+    """Compare avec l'état mémorisé au passage précédent et poste les nouveautés sur Discord.
+    scope : joueurs concernés (une structure) ; only : types d'alertes autorisés ; league : annonce de la structure du mois."""
     opts = dict(DEFAULT_CONFIG["alertes"]); opts.update(cfg.get("alertes") or {})
-    fp = os.path.join(CACHE, "etat_alertes.json")
+    if only is not None:
+        opts = {k: (v and k in only) for k, v in opts.items()}
+    isf = lambda p: p["friend"] and (scope is None or p["puuid"] in scope)
+    players = [p for p in players if scope is None or p["puuid"] in scope]
+    fp = os.path.join(CACHE, state_name)
     os.makedirs(CACHE, exist_ok=True)
     first = not os.path.exists(fp)
     st = json.load(open(fp, encoding="utf-8")) if not first else {}
@@ -657,14 +1068,14 @@ def discord_alerts(cfg, players, data, webhook):
     now_month = datetime.date.today().strftime("%Y-%m")
     embeds = []
 
-    games = sorted(data["games"], key=lambda g: g["date"])
+    games = sorted([g for g in data["games"] if any(isf(p) for p in g["parts"])], key=lambda g: g["date"])
     new = [g for g in games if g["id"] not in seen]
     # séries : position de chaque partie dans la série en cours de chaque joueur
     streak_at = {}
     run = {}
     for g in games:
         for p in g["parts"]:
-            if not p["friend"]:
+            if not isf(p):
                 continue
             last = run.get(p["puuid"], (None, 0))
             n = last[1] + 1 if last[0] == p["win"] else 1
@@ -675,7 +1086,7 @@ def discord_alerts(cfg, players, data, webhook):
         # parties terminées
         if opts.get("parties"):
             for g in new[-12:]:
-                fs = [p for p in g["parts"] if p["friend"]]
+                fs = [p for p in g["parts"] if isf(p)]
                 win = fs[0]["win"]
                 lines = [f"**{names.get(p['puuid'], p['name'])}** · {p['champ']} · {p['k']}/{p['d']}/{p['a']} · note {fr1(p['score'])}" for p in fs]
                 embeds.append({"title": f"{'✅ Victoire' if win else '❌ Défaite'} en {QFR[g['q']]} · {g['dur'] // 60} min",
@@ -686,7 +1097,7 @@ def discord_alerts(cfg, players, data, webhook):
         if opts.get("exploits"):
             for g in new:
                 for p in g["parts"]:
-                    if not p["friend"]:
+                    if not isf(p):
                         continue
                     nm = names.get(p["puuid"], p["name"])
                     if p.get("penta"):
@@ -701,7 +1112,7 @@ def discord_alerts(cfg, players, data, webhook):
         if opts.get("series"):
             for g in new:
                 for p in g["parts"]:
-                    if not p["friend"]:
+                    if not isf(p):
                         continue
                     w, n = streak_at[(g["id"], p["puuid"])]
                     if n >= 5 and n % 5 == 0 or (n == 3 and w):
@@ -726,7 +1137,7 @@ def discord_alerts(cfg, players, data, webhook):
         # joueur du mois (au premier passage d'un nouveau mois)
         if opts.get("joueur_du_mois") and st.get("month") and st["month"] != now_month:
             for q in ("solo", "flex"):
-                top = month_mvp(data["games"], st["month"], q, cfg.get("min_parties_classement", 3), names)
+                top = month_mvp(data["games"], st["month"], q, cfg.get("min_parties_classement", 3), names, isf)
                 if top:
                     medals = ["🥇", "🥈", "🥉"]
                     y, m = map(int, st["month"].split("-"))
@@ -736,6 +1147,15 @@ def discord_alerts(cfg, players, data, webhook):
                                    "description": "\n".join(f"{medals[i]} **{names[pu]}** · note {fr1(sc)} · {n} parties · {round(w / n * 100)} % de victoires"
                                                             for i, (pu, sc, n, w) in enumerate(top)),
                                    "color": GOLD, **({"url": site} if site else {})})
+        # structure du mois (ligue)
+        if league and data.get("structures") and st.get("month") and st["month"] != now_month:
+            ranking = [x for x in struct_points(data, st["month"]) if x["pts"]]
+            if ranking:
+                medals = ["🥇", "🥈", "🥉"] + ["▫️"] * 20
+                embeds.append({"title": f"🏆 Structure du mois : {ranking[0]['st']['nom']}",
+                               "description": "\n".join(f"{medals[i]} **{x['st']['nom']}** · {x['pts']} points · {x['w']} victoires sur {x['n']} parties"
+                                                        for i, x in enumerate(ranking[:10])),
+                               "color": GOLD, **({"url": site} if site else {})})
         # en game (désactivé par défaut)
         if opts.get("en_game"):
             was = set(st.get("live", []))
@@ -745,7 +1165,7 @@ def discord_alerts(cfg, players, data, webhook):
 
     ok = True
     if embeds and webhook:
-        say(f"Discord : {len(embeds)} message(s) envoyé(s).")
+        say(f"Discord{(' ' + title) if title else ''} : {len(embeds)} message(s) envoyé(s).")
         ok = post_discord(webhook, embeds, site)
     elif first:
         say("Discord : premier passage, état mémorisé (aucun message pour ne pas inonder le salon).")
@@ -754,6 +1174,95 @@ def discord_alerts(cfg, players, data, webhook):
                    "ranks": {p["puuid"]: p.get("ranks", {}) for p in players},
                    "live": [p["puuid"] for p in players if p.get("live")]}, open(fp, "w", encoding="utf-8"))
     return embeds
+
+
+def points_window(data, st, t0, t1):
+    """Points d'une structure entre deux dates (même barème que le classement du mois)."""
+    R = data.get("points") or DEFAULT_POINTS
+    mem = set(st["membres"]); per = {}
+    for g in sorted(data["games"], key=lambda g: g["date"]):
+        if not (t0 <= g["date"] < t1):
+            continue
+        day = datetime.datetime.fromtimestamp(g["date"] / 1000).strftime("%Y-%m-%d")
+        for p in g["parts"]:
+            if not p["friend"] or p["puuid"] not in mem:
+                continue
+            a = per.setdefault(p["puuid"], {"pts": 0, "days": {}})
+            if a["days"].get(day, 0) >= R["max_parties_par_jour"]:
+                continue
+            a["days"][day] = a["days"].get(day, 0) + 1
+            v = R["victoire"] if p["win"] else R["defaite"]
+            if p["score"] >= 8: v += R["bonne_partie"]
+            if p["d"] == 0 and p["k"] + p["a"] >= 10: v += R["partie_parfaite"]
+            a["pts"] += v + p.get("penta", 0) * R["penta"] + p.get("quadra", 0) * R["quadra"]
+    return sum(sorted((a["pts"] for a in per.values()), reverse=True)[:R["membres_comptes"]])
+
+
+def day_ms(d, end=False):
+    dt = datetime.datetime.strptime(d, "%Y-%m-%d") + (datetime.timedelta(days=1) if end else datetime.timedelta())
+    return int(dt.timestamp() * 1000)
+
+
+def league_event_alerts(cfg, data, league_hook, hooks):
+    """Rappels d'agenda la veille + annonces de début et de résultat des duels (salon ligue + salons des structures concernées)."""
+    os.makedirs(CACHE, exist_ok=True)
+    fp = os.path.join(CACHE, "etat_ligue.json")
+    first = not os.path.exists(fp)
+    st = json.load(open(fp, encoding="utf-8")) if not first else {}
+    done = set(st.get("done", []))
+    S = {s["id"]: s for s in data.get("structures", [])}
+    nm = lambda i: S.get(i, {}).get("nom", i)
+    today = datetime.date.today()
+    out = []  # (cle, embed, [ids des structures concernées])
+    for ev in data.get("agenda", []):
+        try:
+            d = datetime.date.fromisoformat(ev["date"])
+        except Exception:
+            continue
+        key = f"rappel-{ev['date']}-{ev.get('heure', '')}-{ev.get('a')}-{ev.get('b')}"
+        if d == today + datetime.timedelta(days=1) and key not in done:
+            out.append((key, {"title": f"📅 Demain {('à ' + ev['heure']) if ev.get('heure') else ''} : {nm(ev.get('a'))} contre {nm(ev.get('b'))}".replace("  ", " "),
+                              "description": " · ".join(x for x in [ev.get("type", ""), ev.get("note", "")] if x) or "Match entre structures",
+                              "color": PURPLE}, [ev.get("a"), ev.get("b")]))
+    for du in data.get("duels", []):
+        try:
+            d0, d1 = datetime.date.fromisoformat(du["debut"]), datetime.date.fromisoformat(du["fin"])
+        except Exception:
+            continue
+        base = f"duel-{du['a']}-{du['b']}-{du['debut']}"
+        if d0 <= today <= d1 and base + "-debut" not in done:
+            out.append((base + "-debut", {"title": f"⚔️ Duel lancé : {nm(du['a'])} contre {nm(du['b'])}",
+                                          "description": f"{du.get('titre', '')}\nDu {d0.strftime('%d/%m')} au {d1.strftime('%d/%m')} : la structure qui marque le plus de points gagne.".strip(),
+                                          "color": GOLD}, [du["a"], du["b"]]))
+        if today > d1 and base + "-fin" not in done and du["a"] in S and du["b"] in S:
+            t0, t1 = day_ms(du["debut"]), day_ms(du["fin"], end=True)
+            pa, pb = points_window(data, S[du["a"]], t0, t1), points_window(data, S[du["b"]], t0, t1)
+            win = nm(du["a"]) if pa > pb else nm(du["b"]) if pb > pa else None
+            out.append((base + "-fin", {"title": f"🏁 {'Victoire de ' + win if win else 'Égalité'} dans le duel {nm(du['a'])} contre {nm(du['b'])}",
+                                        "description": f"{nm(du['a'])} : {pa} points\n{nm(du['b'])} : {pb} points", "color": GOLD}, [du["a"], du["b"]]))
+    if first:  # premier passage : on mémorise sans poster (sauf ce qui arrive demain)
+        out = [o for o in out if o[0].startswith("rappel-")]
+    sent = set()
+    for key, emb, who in out:
+        if league_hook:
+            BOT_NAME[0] = data.get("ligue", "La ligue"); post_discord(league_hook, [emb])
+        for sid in who:
+            if hooks.get(sid):
+                BOT_NAME[0] = nm(sid); post_discord(hooks[sid], [emb])
+        sent.add(key)
+    if out:
+        say(f"Discord ligue : {len(out)} annonce(s) (agenda / duels).")
+    # au premier passage, les duels passés sont marqués comme déjà annoncés
+    if first:
+        for du in data.get("duels", []):
+            try:
+                d0, d1 = datetime.date.fromisoformat(du["debut"]), datetime.date.fromisoformat(du["fin"])
+            except Exception:
+                continue
+            base = f"duel-{du['a']}-{du['b']}-{du['debut']}"
+            if d0 <= today: sent.add(base + "-debut")
+            if today > d1: sent.add(base + "-fin")
+    json.dump({"done": sorted(done | sent)}, open(fp, "w", encoding="utf-8"))
 
 
 # --------------------------------------------------------------------------- appli téléphone (PWA)
@@ -980,6 +1489,108 @@ td .ci img{width:26px;height:26px;border-radius:6px;background:#000}
 .items{display:flex;gap:2px}.items img,.items span{width:22px;height:22px;border-radius:4px;background:#0a141a}
 tr.me td{background:rgba(212,173,98,.07)}
 .empty-state{padding:30px 0;color:var(--mut);font-size:15px}
+.grade{display:inline-grid;place-items:center;min-width:44px;height:44px;border-radius:12px;border:2px solid var(--g);color:var(--g);font-family:var(--cond);font-weight:800;font-size:26px;padding:0 6px}
+.grade.sm{min-width:0;height:auto;font-size:15px;padding:2px 9px;border-radius:999px;border-width:1px}
+.grades{display:flex;gap:6px;flex-wrap:wrap;align-items:center}
+.fcard.coach{display:grid;gap:4px}
+.cblock{margin-top:8px}
+.ct{font-family:var(--cond);font-weight:700;font-size:17px;margin-bottom:4px}
+.ct.good{color:var(--teal)} .ct.work{color:var(--gold)}
+.witem{border-left:3px solid var(--gold);padding:4px 0 4px 10px;margin:6px 0}
+.witem b{display:block}.witem p{margin:3px 0 0;font-size:13.5px;color:#cfd6d9}
+.cbar{position:relative;height:6px;border-radius:3px;background:var(--night);margin:6px 0 2px;max-width:280px}
+.cbar i{position:absolute;left:0;top:0;bottom:0;border-radius:3px}
+.cbar em{position:absolute;top:-4px;width:2px;height:14px;background:var(--teal)}
+.moms div{display:flex;gap:10px;font-size:13.5px;padding:3px 0;border-bottom:1px dashed var(--line)}
+.moms .num{color:var(--gold);min-width:42px;font-size:15px}
+.drill{margin-top:12px;background:rgba(60,199,191,.08);border:1px solid rgba(60,199,191,.4);border-radius:10px;padding:9px 12px;font-size:14px}
+.drill span{display:block;font-family:var(--cond);font-weight:700;color:var(--teal);font-size:16px}
+.prio{display:grid;grid-template-columns:36px 1fr;gap:10px;padding:10px 0;border-bottom:1px solid var(--line)}
+.pn{width:32px;height:32px;border-radius:50%;background:var(--gold);color:var(--night);display:grid;place-items:center;font-family:var(--cond);font-weight:800;font-size:18px}
+.pv{font-size:14px;margin-top:4px}
+.zbars div{display:grid;grid-template-columns:120px 1fr 48px;gap:8px;align-items:center;font-size:13.5px;padding:3px 0}
+.zbars i{height:8px;border-radius:4px;background:var(--red);opacity:.8;display:block}
+.zbars b{text-align:right;font-family:var(--cond)}
+.acard{background:var(--ink);border:1px solid var(--line);border-radius:14px;padding:14px 16px;margin-bottom:14px}
+.acard>summary{font-family:var(--cond);font-size:22px;font-weight:700;color:var(--ivory);cursor:pointer}
+.acard input,.acard select,.acard textarea{background:var(--night);border:1px solid var(--line);border-radius:8px;padding:8px 10px;color:var(--ivory);font:inherit;min-width:0}
+.acard input[type=color]{padding:2px;height:38px;width:70px}
+.acard input[type=checkbox]{width:20px;height:20px;accent-color:var(--gold)}
+.agrid{display:grid;grid-template-columns:repeat(auto-fill,minmax(150px,1fr));gap:12px;margin:12px 0}
+.af{display:grid;gap:4px;font-size:13px}.af>span{color:var(--mut)}.af small{color:var(--mut);font-size:11px}.af textarea{width:100%}
+.alist{display:grid;margin-top:12px}
+.arow{display:flex;gap:10px;align-items:center;flex-wrap:wrap;padding:8px 0;border-bottom:1px solid var(--line);font-size:14px}
+.arow b{flex:1;min-width:160px}
+.inl{display:flex;gap:6px;align-items:center;flex-wrap:wrap;margin:6px 0}
+.btn.sm{padding:5px 11px;font-size:13px}.btn.ghost{background:transparent}.btn:disabled{opacity:.45;cursor:default}
+.steps{font-size:14px;color:var(--mut);padding-left:20px}.steps li{margin:4px 0}
+.tedit{border-left:3px solid var(--line);padding-left:12px;margin:12px 0}
+.chk{display:inline-flex;gap:6px;align-items:center;font-size:14px}
+.savebar{position:sticky;bottom:0;z-index:4;background:rgba(12,24,32,.96);border-top:1px solid var(--line);margin:20px -18px 0;padding:12px 0}
+.savebar .wrap{display:flex;gap:12px;align-items:center;justify-content:space-between;flex-wrap:wrap;font-size:14px}
+.duels{display:grid;gap:12px}
+.duelc{background:var(--ink);border:1px solid var(--line);border-radius:14px;padding:12px 14px}
+.duelc.live{border-color:var(--gold)}
+.dh{display:flex;gap:10px;align-items:center;flex-wrap:wrap;font-size:13px}
+.dh span[class^=tag-]{font-weight:700;border-radius:999px;padding:1px 9px;font-size:12px}
+.tag-live{background:var(--gold);color:var(--night)} .tag-soon{border:1px solid var(--teal);color:var(--teal)} .tag-done{border:1px solid var(--line);color:var(--mut)}
+.dv{display:grid;grid-template-columns:1fr auto 1fr;gap:8px;align-items:center;margin-top:10px}
+.ds{display:flex;gap:10px;align-items:center;background:none;border:0;cursor:pointer;padding:0;text-align:left;color:var(--mut);min-width:0}
+.ds.r{justify-content:flex-end;text-align:right}
+.ds b{font-size:15px;min-width:0;overflow:hidden;text-overflow:ellipsis}
+.ds .num{font-family:var(--cond);font-weight:800;font-size:30px;color:var(--ivory)}
+.ds.w b{color:var(--gold2)}
+.vs2{font-family:var(--cond);font-weight:800;color:var(--gold)}
+.dbar{display:flex;height:6px;border-radius:3px;overflow:hidden;margin-top:10px;background:var(--ink2)}
+.dream{display:grid;grid-template-columns:repeat(5,1fr);gap:10px}
+.dcard{min-height:190px;border-radius:14px;border:1px solid var(--line);background:var(--ink) center 20%/cover;display:flex;flex-direction:column;justify-content:flex-end;align-items:flex-start;gap:3px;padding:10px;text-align:left;cursor:pointer;color:var(--ivory)}
+div.dcard{cursor:default}
+.dcard img{width:40px;height:40px;border-radius:50%;border:2px solid var(--gold)}
+.dpos{font-family:var(--cond);font-weight:700;color:var(--gold);font-size:18px;margin-bottom:auto}
+.dcard b{font-size:16px}.dcard small{font-size:12px;color:var(--mut)}
+.recs{display:grid;grid-template-columns:repeat(auto-fill,minmax(300px,1fr));gap:14px}
+.recc{background:var(--ink);border:1px solid var(--line);border-top:4px solid var(--c);border-radius:14px;padding:14px;display:grid;gap:10px}
+.rh{display:flex;gap:12px;align-items:center}.rh b{font-size:18px}
+.rl{display:grid;gap:3px;font-size:14px}.rl .mut{font-size:12px}
+.chipsr{display:flex;gap:6px;flex-wrap:wrap}.chipsr span{border:1px solid var(--teal);color:var(--teal);border-radius:999px;padding:2px 10px;font-size:13px;font-weight:600}
+.tstats{display:grid;grid-template-columns:repeat(auto-fill,minmax(200px,1fr));gap:10px;margin-top:12px}
+.tstats .wide{grid-column:1/-1}.tstats .tile span{display:block}
+.palm{display:flex;gap:6px;flex-wrap:wrap}
+.palm span{border:1px solid var(--c);border-radius:999px;padding:3px 10px;font-size:13px}
+@media (max-width:640px){.dream{grid-template-columns:1fr 1fr}.dream>:last-child{grid-column:1/-1}.ds .num{font-size:24px}.ds b{font-size:13px}}
+.scopes{border-bottom:1px solid var(--line);background:var(--night)}
+.scopes .wrap{display:flex;gap:8px;overflow-x:auto;padding-top:10px;padding-bottom:10px;scrollbar-width:none}
+.sc{flex:none;display:inline-flex;align-items:center;gap:8px;border:1px solid var(--line);background:var(--ink);border-radius:999px;padding:4px 14px 4px 4px;cursor:pointer;font-weight:600;font-size:14px;color:var(--mut)}
+.sc[aria-pressed=true]{border-color:var(--gold);color:var(--ivory);background:var(--ink2)}
+.slogo{border-radius:28%;object-fit:cover;flex:none;background:#000}
+.slogo.txt{display:inline-grid;place-items:center;font-family:var(--cond);font-weight:800;color:var(--night)}
+.mvp .slogo{box-shadow:0 0 0 6px rgba(212,173,98,.15)}
+.sgrid{display:grid;grid-template-columns:repeat(auto-fill,minmax(250px,1fr));gap:12px}
+.scard{display:flex;gap:12px;align-items:center;text-align:left;background:var(--ink);border:1px solid var(--line);border-left:4px solid var(--c);border-radius:12px;padding:12px;cursor:pointer}
+.scard:hover{background:var(--ink2)}
+.badge{display:inline-block;margin-top:4px;font-size:12px;border:1px solid var(--teal);color:var(--teal);border-radius:999px;padding:1px 9px}
+.badge.off{border-color:var(--line);color:var(--mut)}
+.fiche{display:flex;gap:18px;align-items:center;flex-wrap:wrap;padding:18px;border-radius:14px;background:linear-gradient(120deg,color-mix(in srgb,var(--c) 22%,transparent),transparent 70%);border:1px solid var(--line)}
+.links{display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin-top:12px}
+a.btn{text-decoration:none;color:inherit;display:inline-block}
+.champrow{display:flex;gap:14px;flex-wrap:wrap}
+.champrow span{display:inline-flex;align-items:center;gap:6px}
+.champrow img{width:30px;height:30px;border-radius:6px}
+.team{margin-bottom:26px}
+.team .th{display:flex;gap:12px;align-items:baseline;flex-wrap:wrap;border-bottom:2px solid var(--line);padding-bottom:6px}
+.team h3{font-family:var(--cond);font-size:24px;margin:0}
+.rrow{display:grid;grid-template-columns:62px 40px 1fr auto;gap:12px;align-items:center;padding:10px 4px;border-bottom:1px solid var(--line);width:100%;background:none;border-left:0;border-right:0;border-top:0;text-align:left;cursor:pointer}
+div.rrow{cursor:default}
+.rrow img{width:38px;height:38px;border-radius:50%}
+.post{font-family:var(--cond);font-weight:700;font-size:16px;color:var(--gold)}
+.rs{text-align:right}.rs b{display:block;font-family:var(--cond);font-size:24px;line-height:1}.rs small{font-size:12px;color:var(--mut)}
+.match{display:grid;grid-template-columns:110px 1fr 70px 1fr;gap:10px;align-items:center;padding:12px 4px;border-bottom:1px solid var(--line)}
+.match .md{font-size:13px}
+.match .side{display:flex;gap:8px;align-items:center;font-weight:600;color:var(--mut)}
+.match .side.a{justify-content:flex-end;text-align:right}
+.match .side.w{color:var(--ivory)}
+.match .sc2{font-family:var(--cond);font-weight:800;font-size:26px;text-align:center}
+@media (max-width:640px){.match{grid-template-columns:1fr 54px 1fr}.match .md{grid-column:1/-1}.rrow{grid-template-columns:44px 36px 1fr auto;gap:8px}}
 .live{background:linear-gradient(90deg,rgba(226,90,80,.18),rgba(226,90,80,.04));border-bottom:1px solid rgba(226,90,80,.35)}
 .live .wrap{display:flex;gap:14px;align-items:center;flex-wrap:wrap;padding-top:9px;padding-bottom:9px;font-size:14px}
 .live .dot{width:10px;height:10px;border-radius:50%;background:var(--red);box-shadow:0 0 0 0 rgba(226,90,80,.6)}
@@ -1059,9 +1670,10 @@ footer .wrap{display:flex;gap:16px;flex-wrap:wrap;justify-content:space-between;
 <body>
 <div id="live"></div>
 <header class="hero" id="hero"></header>
+<div id="scopes"></div>
 <nav class="tabs" aria-label="Sections"><div class="wrap" id="tabs"></div></nav>
 <main><div class="wrap" id="main"></div></main>
-<footer><div class="wrap"><span>La ligue des potes isn't endorsed by Riot Games and doesn't reflect the views or opinions of Riot Games or anyone officially involved in producing or managing Riot Games properties. Riot Games, and all associated properties are trademarks or registered trademarks of Riot Games, Inc.</span><span id="install"></span></div></footer>
+<footer><div class="wrap"><span><span id="pname">La ligue des potes</span> isn't endorsed by Riot Games and doesn't reflect the views or opinions of Riot Games or anyone officially involved in producing or managing Riot Games properties. Riot Games, and all associated properties are trademarks or registered trademarks of Riot Games, Inc.</span><span id="install"></span><a href="#admin" class="mut" style="font-size:12px">Admin</a></div></footer>
 <script>
 "use strict";
 const D=__DATA__;
@@ -1072,6 +1684,7 @@ const el=(t,a={},...k)=>{const e=document.createElement(t);for(const[x,v]of Obje
   for(const c of k.flat(9))if(c!=null&&c!==false)e.append(c.nodeType?c:document.createTextNode(String(c)));return e;};
 const fmt=(n,d=0)=>(n==null||!isFinite(n))?"–":Number(n).toLocaleString("fr-FR",{maximumFractionDigits:d,minimumFractionDigits:d});
 const cap=s=>s.charAt(0).toUpperCase()+s.slice(1);
+const ord=n=>n===1?"1er":`${n}e`;
 const pl=(n,one,many,d=0)=>`${fmt(n,d)} ${Math.abs(n)>=2?many:one}`;
 const DDV="https://ddragon.leagueoflegends.com/cdn/"+(D.ddv||"15.1.1");
 const FIX={FiddleSticks:"Fiddlesticks"};
@@ -1082,6 +1695,9 @@ const iconSrc=id=>`${DDV}/img/profileicon/${id||29}.png`;
 const avatar=(pu,cls)=>el("img",{src:iconSrc(P[pu]?.icon),alt:"",class:cls});
 const itemImg=i=>i?el("img",{src:`${DDV}/img/item/${i}.png`,alt:"",loading:"lazy"}):el("span");
 const P=Object.fromEntries(D.players.map(p=>[p.puuid,p]));
+const ALL=D.players;
+let PL=ALL, SC=new Set(ALL.map(p=>p.puuid));      // joueurs du périmètre affiché (toute la ligue ou une structure)
+const isF=p=>!!p&&p.friend&&SC.has(p.puuid);
 const TIERS={IRON:["Fer","#8a8a8a"],BRONZE:["Bronze","#b07d58"],SILVER:["Argent","#aab7bf"],GOLD:["Or","#d4ad62"],PLATINUM:["Platine","#45bfae"],
   EMERALD:["Émeraude","#3fcf7f"],DIAMOND:["Diamant","#7fb2ff"],MASTER:["Maître","#c07cff"],GRANDMASTER:["Grand Maître","#ff6b6b"],CHALLENGER:["Challenger","#f4d35e"]};
 const tierTxt=r=>{ if(!r) return el("span",{class:"tier mut"},"Non classé"); const [n,c]=TIERS[r.tier]||[r.tier,"#aaa"];
@@ -1093,18 +1709,18 @@ const months=[...new Set(D.games.map(g=>g.month))].sort().reverse();
 const nowKey=(()=>{const d=new Date(); return `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,"0")}`;})();
 if(!months.includes(nowKey)&&!D.demo) months.unshift(nowKey);
 
-let S={month:months[0]||"all",q:"solo",tab:"board",sort:"note",gp:"all",cp:"all",hm:"n",dm:"d",da:D.players[0]?.puuid,db:D.players[1]?.puuid,rc:""};
+let S={month:months[0]||"all",q:"solo",tab:"board",sort:"note",gp:"all",cp:"all",hm:"n",dm:"d",da:PL[0]?.puuid,db:PL[1]?.puuid,rc:""};
 const PCOL=["#3cc7bf","#d4ad62","#e2786f","#a98bff","#6fb3ff","#9bd46a","#ff8fc7","#ff9f5a","#c9d3d6","#58e0a0"];
 const colorOf=pu=>PCOL[D.players.findIndex(p=>p.puuid===pu)%PCOL.length];
 
 /* ---------- agrégation ---------- */
-function gamesFor(month,q){ return D.games.filter(g=>(month==="all"||g.month===month)&&(!q||g.q===q)); }
+function gamesFor(month,q){ return D.games.filter(g=>(month==="all"||g.month===month)&&(!q||g.q===q)&&g.parts.some(isF)); }
 function aggregate(month,q){
-  const A={}; for(const p of D.players) A[p.puuid]={puuid:p.puuid,games:0,wins:0,k:0,d:0,a:0,cs:0,min:0,dmg:0,vis:0,gold:0,kp:0,score:0,fb:0,penta:0,quadra:0,triple:0,
+  const A={}; for(const p of PL) A[p.puuid]={puuid:p.puuid,games:0,wins:0,k:0,d:0,a:0,cs:0,min:0,dmg:0,vis:0,gold:0,kp:0,score:0,fb:0,penta:0,quadra:0,triple:0,
     dragons:0,barons:0,towers:0,solo:0,dodged:0,dead:0,steals:0,ally:0,taken:0,remontada:0,throws:0,champs:{},pos:{},res:[],list:[]};
   const gs=gamesFor(month,q).slice().sort((a,b)=>a.date-b.date);
   for(const g of gs){ const minutes=g.dur/60;
-    for(const p of g.parts){ if(!p.friend||!A[p.puuid]) continue; const a=A[p.puuid];
+    for(const p of g.parts){ if(!isF(p)||!A[p.puuid]) continue; const a=A[p.puuid];
       a.games++; a.wins+=p.win?1:0; a.k+=p.k; a.d+=p.d; a.a+=p.a; a.cs+=p.cs; a.min+=minutes; a.dmg+=p.dmg; a.vis+=p.vis; a.gold+=p.gold;
       a.kp+=p.kp||0; a.score+=p.score; for(const f of ["fb","penta","quadra","triple","dragons","barons","towers","solo","dodged","dead","steals","ally","taken"]) a[f]+=p[f]||0;
       a.champs[p.champ]=(a.champs[p.champ]||0)+1; a.pos[p.pos]=(a.pos[p.pos]||0)+1; a.res.push(p.win?1:0); a.list.push({g,p});
@@ -1121,6 +1737,7 @@ const ranked=A=>Object.values(A).filter(a=>a.games>=D.minGames);
 
 /* ---------- héros ---------- */
 function renderHero(){
+  if(MULTI&&S.scope==="league"){ const h=$("hero"); h.replaceChildren(); leagueHero(h); return; }
   const A=aggregate(S.month,S.q), R=ranked(A).sort((a,b)=>b.note-a.note), mvp=R[0];
   const h=$("hero"); h.replaceChildren();
   const sel=el("select",{"aria-label":"Mois",onchange:e=>{S.month=e.target.value; render();}},[...months,"all"].map(m=>el("option",{value:m},monthName(m))));
@@ -1128,7 +1745,7 @@ function renderHero(){
   if(mvp?.topChamp) h.append(el("div",{class:"bg",style:`background-image:url('${splash(mvp.topChamp[0])}')`}));
   const seg=el("div",{class:"seg",role:"group","aria-label":"File"},["solo","flex"].map(q=>el("button",{"aria-pressed":S.q===q?"true":"false",onclick:()=>{S.q=q; render();}},QN[q])));
   h.append(el("div",{class:"wrap"},
-    el("div",{class:"league"},`La ligue des potes, ${QN[S.q].toLowerCase()}`),
+    el("div",{class:"league"},MULTI?`${SBY[S.scope].nom}, ${QN[S.q].toLowerCase()}`:`La ligue des potes, ${QN[S.q].toLowerCase()}`),
     el("div",{class:"month"},sel),
     mvp?el("div",{class:"mvp"},el("img",{class:"av",src:iconSrc(P[mvp.puuid]?.icon),alt:""}),
       el("div",{},el("div",{class:"what"},S.month==="all"?"Meilleur joueur de la période":"Joueur du mois"),el("div",{class:"who"},P[mvp.puuid].name),
@@ -1139,15 +1756,23 @@ function renderHero(){
 }
 
 /* ---------- navigation ---------- */
-const TABS=[["board","Classement"],["trophies","Trophées"],["wrapped","Wrapped"],["records","Records"],["charts","Graphiques"],["duel","Duel"],["games","Parties"],["duos","Duos"],["hall","Palmarès"]];
+const TABS=[["board","Classement"],["coach","Coach"],["postes","Postes"],["trophies","Trophées"],["wrapped","Wrapped"],["records","Records"],["charts","Graphiques"],["duel","Duel"],["games","Parties"],["duos","Duos"],["hall","Palmarès"]];
+const TABS_L=[["league","Structures"],["board","Joueurs"],["coach","Coach"],["postes","Postes"],["recrut","Recrutement"],["agenda","Agenda"],["matches","Matchs"],["trophies","Trophées"],["records","Records"],["charts","Graphiques"],["lhall","Palmarès"]];
+const TABS_S=[["sfiche","Fiche"],["teams","Équipes"],["board","Classement"],["coach","Coach"],["postes","Postes"],["agenda","Agenda"],["matches","Matchs"],["trophies","Trophées"],["wrapped","Wrapped"],["records","Records"],["charts","Graphiques"],["duel","Duel"],["games","Parties"],["duos","Duos"],["hall","Palmarès"]];
 function render(){
   const y=scrollY;
+  $("hero").style.display=location.hash==="#admin"?"none":"";
+  if(location.hash==="#admin"){ $("live").replaceChildren(); $("hero").replaceChildren(); $("scopes").replaceChildren();
+    $("tabs").replaceChildren(el("button",{"aria-current":"page"},"Admin"),el("button",{onclick:()=>{ if(AD.dirty&&!confirm("Quitter sans enregistrer ?")) return; location.hash=""; }},"Retour au site"));
+    const m=$("main"); m.replaceChildren(); admin(m); scrollTo(0,y); return; }
+  const tabs=MULTI?(S.scope==="league"?TABS_L:TABS_S):TABS; if(!tabs.some(t=>t[0]===S.tab)) S.tab=tabs[0][0];
+  $("scopes").replaceChildren(...[scopeBar()].filter(Boolean));
   $("live").replaceChildren(...[liveBanner()].filter(Boolean));
   renderHero();
-  $("tabs").replaceChildren(...TABS.map(([k,n])=>el("button",{"aria-current":S.tab===k?"page":null,onclick:()=>{S.tab=k; render();}},n)));
+  $("tabs").replaceChildren(...tabs.map(([k,n])=>el("button",{"aria-current":S.tab===k?"page":null,onclick:()=>{S.tab=k; render();}},n)));
   const m=$("main"); m.replaceChildren();
-  if(D.demo) m.append(el("div",{class:"demo"},"Exemple avec des joueurs et des parties inventés. Mets ta clé API dans config.json et relance le programme sans --demo pour voir vos vraies parties."));
-  ({board,trophies,wrapped,records,charts,duel,games,duos,hall})[S.tab](m);
+  if(D.demo) m.append(el("div",{class:"demo"},MULTI?"Exemple avec des structures, des joueurs et des parties inventés.":"Exemple avec des joueurs et des parties inventés. Mets ta clé API dans config.json et relance le programme sans --demo pour voir vos vraies parties."));
+  ({board,trophies,wrapped,records,charts,duel,games,duos,hall,league,sfiche,teams,matches,lhall:leagueHall,postes,recrut,agenda,coach:coachTab})[S.tab](m);
   scrollTo(0,y); // garde la position quand on touche un filtre
 }
 
@@ -1226,7 +1851,7 @@ function trophies(m){
 
 /* ---------- records (sur une partie) ---------- */
 function records(m){
-  const rows=[]; for(const g of gamesFor(S.month,S.q)) for(const p of g.parts) if(p.friend) rows.push({g,p,kda:(p.k+p.a)/Math.max(1,p.d),csm:p.cs/(g.dur/60)});
+  const rows=[]; for(const g of gamesFor(S.month,S.q)) for(const p of g.parts) if(isF(p)) rows.push({g,p,kda:(p.k+p.a)/Math.max(1,p.d),csm:p.cs/(g.dur/60)});
   m.append(el("h2",{},`Records ${QN[S.q].toLowerCase()}`),el("p",{class:"lead"},`${monthName(S.month)}. Les meilleures (et pires) performances sur une seule partie. Touche un record pour revoir la partie.`));
   if(!rows.length){ m.append(el("p",{class:"empty-state"},"Aucune partie sur cette période.")); return; }
   const best=(f,dir=1,filter=()=>true)=>rows.filter(filter).sort((a,b)=>(f(b)-f(a))*dir)[0];
@@ -1245,6 +1870,497 @@ function records(m){
   m.append(el("div",{class:"table"},R.filter(r=>r[1]).map(([t,r,v,s])=>el("button",{class:"rec",onclick:()=>openReview(r.g)},
     el("div",{class:"t"},t),el("div",{class:"big"},v(r)),
     el("div",{class:"by"},champImg(r.p.champ),el("b",{},r.p.name),el("span",{},s(r)),el("span",{},new Date(r.g.date).toLocaleDateString("fr-FR",{day:"numeric",month:"short"})))))));
+}
+
+/* =====================================================================
+   LIGUE DES STRUCTURES (mode « structures » de config.json)
+   ===================================================================== */
+const MULTI=D.mode==="structures";
+const STS=D.structures||[];
+const SBY=Object.fromEntries(STS.map(s=>[s.id,s]));
+const PTS=D.points||{victoire:3,defaite:1,bonne_partie:1,partie_parfaite:2,quadra:2,penta:5,max_parties_par_jour:8,membres_comptes:10};
+function setScope(id,keepTab){
+  S.scope=MULTI&&SBY[id]?id:"league";
+  PL=S.scope==="league"?ALL:ALL.filter(p=>(p.structs||[]).includes(S.scope));
+  SC=new Set(PL.map(p=>p.puuid));
+  const ok=v=>v&&SC.has(v);
+  if(!ok(S.cp)) S.cp="all"; if(!ok(S.gp)) S.gp="all"; if(!ok(S.wp)) S.wp=PL[0]?.puuid;
+  if(!ok(S.da)) S.da=PL[0]?.puuid; if(!ok(S.db)||S.db===S.da) S.db=PL.find(p=>p.puuid!==S.da)?.puuid;
+  S.mp=PL.map(p=>p.puuid); S.rc="";
+  if(!keepTab) S.tab=MULTI?(S.scope==="league"?"league":"sfiche"):"board";
+  if(MULTI&&location.hash!=="#admin"&&!location.hash.startsWith("#j-")){ const h=S.scope==="league"?"":"#s-"+S.scope; if(location.hash!==h) history.replaceState(null,"",h||location.pathname); }
+}
+const logo=(st,size=40)=>st?.logo?el("img",{src:st.logo,alt:"",class:"slogo",style:`width:${size}px;height:${size}px`})
+  :el("span",{class:"slogo txt",style:`width:${size}px;height:${size}px;background:${st?.couleur||"#2a3f4d"};font-size:${Math.round(size*.38)}px`},(st?.tag||"?").slice(0,3));
+function structPoints(month){
+  return STS.map(st=>{ const mem=new Set(st.membres), per={};
+    for(const g of D.games.filter(g=>month==="all"||g.month===month).sort((a,b)=>a.date-b.date)){
+      const day=new Date(g.date).toDateString();
+      for(const p of g.parts){ if(!p.friend||!mem.has(p.puuid)) continue;
+        const a=(per[p.puuid]??={pts:0,n:0,w:0,days:{}}); if((a.days[day]||0)>=PTS.max_parties_par_jour) continue; a.days[day]=(a.days[day]||0)+1;
+        let v=p.win?PTS.victoire:PTS.defaite; if(p.score>=8) v+=PTS.bonne_partie; if(p.d===0&&p.k+p.a>=10) v+=PTS.partie_parfaite;
+        v+=(p.penta||0)*PTS.penta+(p.quadra||0)*PTS.quadra; a.pts+=v; a.n++; a.w+=p.win?1:0; } }
+    const list=Object.entries(per).map(([pu,a])=>({pu,...a})).sort((a,b)=>b.pts-a.pts);
+    const top=list.slice(0,PTS.membres_comptes);
+    return {st,pts:top.reduce((s,a)=>s+a.pts,0),n:list.reduce((s,a)=>s+a.n,0),w:list.reduce((s,a)=>s+a.w,0),active:list.length,best:list[0]||null,list};
+  }).sort((a,b)=>b.pts-a.pts||b.w-a.w);
+}
+function scopeBar(){
+  if(!MULTI) return null;
+  return el("div",{class:"scopes"},el("div",{class:"wrap"},
+    el("button",{class:"sc","aria-pressed":S.scope==="league"?"true":"false",onclick:()=>{setScope("league"); render(); scrollTo(0,0);}},el("span",{class:"slogo txt",style:"width:26px;height:26px;background:var(--gold);color:var(--night);font-size:13px"},"★"),"La ligue"),
+    STS.map(st=>el("button",{class:"sc","aria-pressed":S.scope===st.id?"true":"false",onclick:()=>{setScope(st.id); render(); scrollTo(0,0);}},logo(st,26),st.nom))));
+}
+function leagueHero(h){
+  const R=structPoints(S.month), lead=R[0]&&R[0].pts?R[0]:null;
+  const sel=el("select",{"aria-label":"Mois",onchange:e=>{S.month=e.target.value; render();}},[...months,"all"].map(m=>el("option",{value:m},monthName(m)))); sel.value=S.month;
+  const bestP=lead?.best;
+  if(bestP&&P[bestP.pu]){ const top=aggregate(S.month,null)[bestP.pu]?.topChamp; if(top) h.append(el("div",{class:"bg",style:`background-image:url('${splash(top[0])}')`})); }
+  h.append(el("div",{class:"wrap"},el("div",{class:"league"},D.ligue||"La ligue des structures"),el("div",{class:"month"},sel),
+    lead?el("div",{class:"mvp"},logo(lead.st,76),el("div",{},el("div",{class:"what"},S.month==="all"?"En tête sur la période":"Structure du mois"),el("div",{class:"who"},lead.st.nom),
+      el("div",{class:"line"},el("span",{},el("b",{},fmt(lead.pts)),"points"),el("span",{},el("b",{},lead.w),"victoires"),el("span",{},el("b",{},lead.active),"joueurs actifs"))))
+    :el("p",{class:"empty"},"Pas encore de partie classée ce mois-ci : le premier qui gagne met sa structure en tête.")));
+}
+/* ---------- onglet Structures (ligue) ---------- */
+function league(m){
+  const R=structPoints(S.month);
+  const db=duelsBlock(); if(db) m.append(db);
+  m.append(el("h2",{},"Classement des structures"),el("p",{class:"lead"},`${monthName(S.month)}. Touche une structure pour ouvrir sa page.`),
+    el("div",{class:"table"},R.map((x,i)=>el("button",{class:`row${x.pts&&i<3?" r"+(i+1):""}`,onclick:()=>{setScope(x.st.id); render(); scrollTo(0,0);}},
+      el("div",{class:"rk"},x.pts?i+1:"–"),
+      el("div",{},el("div",{class:"pl"},logo(x.st,44),el("div",{},el("div",{class:"n"},x.st.nom),el("span",{class:"tier",style:`color:${x.st.couleur}`},x.st.tag+(x.st.recrutement?", recrute":"")))),
+        el("div",{class:"strip"},el("span",{},el("b",{},`${x.w}-${x.n-x.w}`),"V-D"),el("span",{},el("b",{},x.active),"joueurs actifs"),
+          x.best?el("span",{},el("b",{},P[x.best.pu]?.name),`meilleur contributeur, ${x.best.pts} pts`):null)),
+      el("div",{class:"score"},el("b",{},fmt(x.pts)),el("small",{},"points"))))),
+    el("p",{class:"foot"},`Calcul des points : chaque partie classée (solo/duo ou flex) d'un membre rapporte ${PTS.victoire} points pour une victoire et ${PTS.defaite} pour une défaite, plus ${PTS.bonne_partie} si sa note est de 8 ou plus, ${PTS.partie_parfaite} pour une partie sans mourir (10 kills + assistances au moins), ${PTS.quadra} par quadrakill et ${PTS.penta} par pentakill. Au plus ${PTS.max_parties_par_jour} parties comptées par joueur et par jour, et seuls les ${PTS.membres_comptes} meilleurs membres de chaque structure comptent : une petite structure active peut battre une grosse. Remise à zéro chaque mois.`));
+  m.append(el("div",{class:"qtitle"},"Les structures"),el("div",{class:"sgrid"},STS.map(st=>el("button",{class:"scard",style:`--c:${st.couleur}`,onclick:()=>{setScope(st.id); render(); scrollTo(0,0);}},
+    logo(st,52),el("div",{},el("b",{},st.nom),el("div",{class:"mut",style:"font-size:13px"},`${st.membres.length} joueurs, ${st.equipes.length} équipe${st.equipes.length>1?"s":""}`),
+      st.recrutement?el("span",{class:"badge"},"Recrute"):null)))));
+}
+/* ---------- fiche d'une structure ---------- */
+function sfiche(m){
+  const st=SBY[S.scope]; const R=structPoints(S.month), me=R.find(x=>x.st.id===st.id), place=R.indexOf(me)+1;
+  const A=aggregate(S.month,null), act=ranked(A).sort((a,b)=>b.note-a.note);
+  const soloAvg=PL.map(p=>p.ranks?.solo).filter(Boolean).map(r=>["IRON","BRONZE","SILVER","GOLD","PLATINUM","EMERALD","DIAMOND"].includes(r.tier)?["IRON","BRONZE","SILVER","GOLD","PLATINUM","EMERALD","DIAMOND"].indexOf(r.tier)*400+({IV:0,III:1,II:2,I:3}[r.div]||0)*100+r.lp:2800+r.lp);
+  const avg=soloAvg.length?soloAvg.reduce((a,b)=>a+b,0)/soloAvg.length:null;
+  const champs={}; for(const g of gamesFor(S.month,null)) for(const p of g.parts) if(isF(p)) champs[p.champ]=(champs[p.champ]||0)+1;
+  const topC=Object.entries(champs).sort((a,b)=>b[1]-a[1]).slice(0,6);
+  m.append(...[el("div",{class:"fiche",style:`--c:${st.couleur}`},logo(st,96),el("div",{},el("h2",{style:"margin:0"},st.nom),el("div",{class:"mut"},st.tag),
+      st.description?el("p",{style:"margin:8px 0 0;max-width:62ch"},st.description):null,
+      el("div",{class:"links"},st.discord?el("a",{class:"btn gold",href:st.discord,target:"_blank",rel:"noopener"},"Rejoindre le Discord"):null,
+        Object.entries(st.reseaux||{}).map(([n,u])=>el("a",{class:"btn",href:u,target:"_blank",rel:"noopener"},n)),
+        el("span",{class:st.recrutement?"badge":"badge off"},st.recrutement?"Recrutement ouvert":"Recrutement fermé")))),
+    el("div",{class:"tiles",style:"margin-top:18px"},
+      [[place&&me.pts?ord(place):"–",`au classement des structures (${monthName(S.month).toLowerCase()})`],[fmt(me?.pts||0),"points ce mois-ci"],
+       [`${me?.w||0}-${(me?.n||0)-(me?.w||0)}`,"victoires-défaites"],[String(st.membres.length),"joueurs suivis"],
+       [avg!=null?lpLabel(avg):"–","rang solo moyen"],[act[0]?P[act[0].puuid].name:"–","joueur du mois"]].map(([v,l])=>el("div",{class:"tile"},el("b",{},v),el("span",{},l)))),
+    topC.length?[el("div",{class:"qtitle"},"Champions les plus joués"),el("div",{class:"champrow"},topC.map(([c,n])=>el("span",{},champImg(c),`${c} `,el("span",{class:"mut"},n))))]:null,
+    duelsBlock(st.id),
+    el("div",{class:"qtitle"},"Lien de la page"),el("p",{class:"mut",style:"font-size:13px;word-break:break-all"},location.href.split("#")[0]+"#s-"+st.id)].flat(9).filter(Boolean));
+}
+/* ---------- équipes ---------- */
+function teams(m){
+  const st=SBY[S.scope], A=aggregate(S.month,null);
+  m.append(el("h2",{},"Équipes"),el("p",{class:"lead"},`Rosters de ${st.nom}. Stats ranked de ${monthName(S.month).toLowerCase()}. Touche un joueur pour son profil.`));
+  const inTeam=new Set();
+  const row=(pu,riot,poste,role)=>{ const p=P[pu], a=pu?A[pu]:null; if(pu) inTeam.add(pu);
+    return el(pu?"button":"div",{class:"rrow",onclick:pu?()=>openProfile(pu):null},
+      el("span",{class:"post"},({TOP:"Top",JUNGLE:"Jgl",MIDDLE:"Mid",BOTTOM:"ADC",UTILITY:"Sup"})[poste]||poste||"–"),
+      pu?avatar(pu):el("span",{class:"slogo txt",style:"width:38px;height:38px;background:var(--ink2)"},"?"),
+      el("div",{},el("b",{},p?p.name:riot),role&&role!=="titulaire"?el("span",{class:"mut"},` ${role}`):null,el("div",{},p?tierTxt(p.ranks?.solo):el("span",{class:"tier loss"},"compte introuvable"))),
+      el("div",{class:"rs"},a?.games?[el("b",{},fmt(a.note,1)),el("small",{},`${pl(a.games,"partie","parties")}, ${fmt(a.wr)} %`)]:el("small",{class:"mut"},"pas de partie"))); };
+  for(const t of st.equipes) m.append(el("div",{class:"team"},el("div",{class:"th"},el("h3",{},t.nom),t.coach?el("span",{class:"mut"},`Coach : ${t.coach}`):null),
+    t.joueurs.map(j=>row(j.puuid,j.riot,j.poste,j.role)),teamStats(t)));
+  const others=st.membres.filter(pu=>!inTeam.has(pu));
+  if(others.length) m.append(el("div",{class:"team"},el("div",{class:"th"},el("h3",{},"Autres membres")),others.map(pu=>row(pu,"",P[pu]?.pos||"",""))));
+}
+/* ---------- matchs entre structures ---------- */
+function matches(m){
+  const all=(D.matchs||[]).filter(x=>S.scope==="league"||x.a===S.scope||x.b===S.scope).slice().sort((a,b)=>String(b.date).localeCompare(String(a.date)));
+  m.append(el("h2",{},"Matchs entre structures"),el("p",{class:"lead"},"Scrims et matchs officiels, saisis dans la liste « matchs » de config.json."));
+  if(!all.length){ m.append(el("p",{class:"empty-state"},"Aucun match enregistré pour l'instant.")); return; }
+  const win=x=>{ const [a,b]=String(x.score||"").split(/[-:]/).map(Number); return a>b?x.a:b>a?x.b:null; };
+  // bilan
+  const rec={}; for(const x of all){ const w=win(x); for(const s of [x.a,x.b]){ const r=(rec[s]??={w:0,l:0}); if(w===s) r.w++; else if(w) r.l++; } }
+  const order=Object.entries(rec).filter(([id])=>S.scope==="league"||id!==S.scope).sort((a,b)=>b[1].w-a[1].w||a[1].l-b[1].l);
+  if(S.scope==="league") m.append(el("div",{class:"qtitle",style:"margin-top:0"},"Bilan"),el("div",{class:"table"},order.map(([id,r])=>el("div",{class:"duo"},logo(SBY[id],38),el("b",{},SBY[id]?.nom||id),el("div",{class:"wr"},`${r.w}-${r.l}`)))));
+  else { const vs={}; for(const x of all){ const o=x.a===S.scope?x.b:x.a; const w=win(x); const r=(vs[o]??={w:0,l:0}); if(w===S.scope) r.w++; else if(w) r.l++; }
+    m.append(el("div",{class:"qtitle",style:"margin-top:0"},"Confrontations"),el("div",{class:"table"},Object.entries(vs).map(([o,r])=>el("div",{class:"duo"},logo(SBY[o],38),el("b",{},`contre ${SBY[o]?.nom||o}`),el("div",{class:`wr ${r.w>=r.l?"win":"loss"}`},`${r.w}-${r.l}`))))); }
+  m.append(el("div",{class:"qtitle"},"Résultats"),el("div",{class:"table"},all.map(x=>{ const w=win(x); const [sa,sb]=String(x.score||"").split(/[-:]/);
+    return el("div",{class:"match"},el("div",{class:"md"},new Date(x.date).toLocaleDateString("fr-FR",{day:"numeric",month:"short",year:"numeric"}),el("br"),el("span",{class:"mut"},x.type||"")),
+      el("div",{class:"side a"+(w===x.a?" w":"")},el("span",{},SBY[x.a]?.nom||x.a),logo(SBY[x.a],34)),
+      el("div",{class:"sc2"},`${sa??"?"} - ${sb??"?"}`),
+      el("div",{class:"side b"+(w===x.b?" w":"")},logo(SBY[x.b],34),el("span",{},SBY[x.b]?.nom||x.b))); })));
+}
+/* ---------- palmarès de la ligue ---------- */
+function leagueHall(m){
+  m.append(el("h2",{},"Palmarès de la ligue"),el("p",{class:"lead"},"La structure du mois, mois après mois."));
+  const titles={};
+  m.append(el("div",{class:"table"},months.map(mo=>{ const R=structPoints(mo), w=R[0]?.pts?R[0]:null; if(w&&mo!==nowKey) titles[w.st.id]=(titles[w.st.id]||0)+1;
+    return el("div",{class:"hall"},el("div",{class:"m"},monthName(mo)),w?el("div",{class:"w"},logo(w.st,40),el("div",{},el("b",{},w.st.nom),el("span",{class:"mut",style:"font-size:13px"},`${w.pts} points`))):el("div",{class:"mut"},"Pas de vainqueur"),
+      R[1]?.pts?el("div",{class:"mut",style:"font-size:13px"},`2e : ${R[1].st.nom} (${R[1].pts})`):el("div")); })));
+  const t=Object.entries(titles).sort((a,b)=>b[1]-a[1]);
+  if(t.length) m.append(el("div",{class:"qtitle"},"Titres de structure du mois (mois terminés)"),el("div",{class:"table"},t.map(([id,n])=>el("div",{class:"duo"},logo(SBY[id],38),el("b",{},SBY[id].nom),el("div",{class:"wr gold"},n)))));
+}
+
+/* ---------- duels de structures ---------- */
+function pointsWindow(st,t0,t1){
+  const mem=new Set(st.membres), per={};
+  for(const g of D.games.filter(g=>g.date>=t0&&g.date<t1).sort((a,b)=>a.date-b.date)){ const day=new Date(g.date).toDateString();
+    for(const p of g.parts){ if(!p.friend||!mem.has(p.puuid)) continue; const a=(per[p.puuid]??={pts:0,days:{}});
+      if((a.days[day]||0)>=PTS.max_parties_par_jour) continue; a.days[day]=(a.days[day]||0)+1;
+      let v=p.win?PTS.victoire:PTS.defaite; if(p.score>=8) v+=PTS.bonne_partie; if(p.d===0&&p.k+p.a>=10) v+=PTS.partie_parfaite; a.pts+=v+(p.penta||0)*PTS.penta+(p.quadra||0)*PTS.quadra; } }
+  return Object.values(per).map(a=>a.pts).sort((a,b)=>b-a).slice(0,PTS.membres_comptes).reduce((s,v)=>s+v,0);
+}
+const dayStart=d=>{ const [y,m,dd]=d.split("-").map(Number); return new Date(y,m-1,dd).getTime(); };
+const dfmt=(d,o={day:"numeric",month:"short"})=>new Date(dayStart(d)).toLocaleDateString("fr-FR",o);
+function duelsBlock(onlyId){
+  const list=(D.duels||[]).filter(d=>SBY[d.a]&&SBY[d.b]&&(!onlyId||d.a===onlyId||d.b===onlyId));
+  if(!list.length) return null;
+  const now=Date.now();
+  const rows=list.map(d=>{ const t0=dayStart(d.debut), t1=dayStart(d.fin)+864e5; const st=now<t0?"soon":now>=t1?"done":"live";
+    const pa=st==="soon"?0:pointsWindow(SBY[d.a],t0,t1), pb=st==="soon"?0:pointsWindow(SBY[d.b],t0,t1); return {d,st,pa,pb,t0}; })
+    .sort((x,y)=>({live:0,soon:1,done:2})[x.st]-({live:0,soon:1,done:2})[y.st]||y.t0-x.t0);
+  return el("section",{class:"block"},el("h3",{},"Duels de structures"),el("p",{class:"lead"},"Deux structures s'affrontent sur une période : celle qui marque le plus de points (même barème que le classement) gagne."),
+    el("div",{class:"duels"},rows.map(({d,st,pa,pb})=>{ const tot=pa+pb||1, wa=st==="done"&&pa>pb, wb=st==="done"&&pb>pa;
+      return el("div",{class:"duelc "+st},el("div",{class:"dh"},el("span",{class:"tag-"+st},st==="live"?"En cours":st==="soon"?"À venir":"Terminé"),
+          el("span",{class:"mut"},`${d.titre?d.titre+", ":""}du ${dfmt(d.debut)} au ${dfmt(d.fin)}`)),
+        el("div",{class:"dv"},el("button",{class:"ds"+(wa?" w":""),onclick:()=>{setScope(d.a); render(); scrollTo(0,0);}},logo(SBY[d.a],40),el("b",{},SBY[d.a].nom),el("span",{class:"num"},fmt(pa))),
+          el("span",{class:"vs2"},"VS"),
+          el("button",{class:"ds r"+(wb?" w":""),onclick:()=>{setScope(d.b); render(); scrollTo(0,0);}},el("span",{class:"num"},fmt(pb)),el("b",{},SBY[d.b].nom),logo(SBY[d.b],40))),
+        st!=="soon"?el("div",{class:"dbar"},el("i",{style:`width:${pa/tot*100}%;background:${SBY[d.a].couleur}`}),el("i",{style:`width:${pb/tot*100}%;background:${SBY[d.b].couleur}`})):null); })));
+}
+
+/* ---------- classement par poste + équipe type ---------- */
+const POSTES=[["TOP","Top"],["JUNGLE","Jungle"],["MIDDLE","Mid"],["BOTTOM","ADC"],["UTILITY","Support"]];
+function byPost(month,q){
+  const R={}; for(const [k] of POSTES) R[k]={};
+  for(const g of gamesFor(month,q)) for(const p of g.parts){ if(!isF(p)||!R[p.pos]) continue;
+    const a=(R[p.pos][p.puuid]??={pu:p.puuid,n:0,w:0,s:0,k:0,d:0,a:0,ch:{}}); a.n++; a.w+=p.win?1:0; a.s+=p.score; a.k+=p.k; a.d+=p.d; a.a+=p.a; a.ch[p.champ]=(a.ch[p.champ]||0)+1; }
+  const out={}; for(const [k] of POSTES) out[k]=Object.values(R[k]).map(a=>({...a,note:a.s/a.n,wr:a.w/a.n*100,kda:(a.k+a.a)/Math.max(1,a.d),top:Object.entries(a.ch).sort((x,y)=>y[1]-x[1])[0][0]}))
+    .sort((x,y)=>(y.n>=D.minGames)-(x.n>=D.minGames)||y.note-x.note);
+  return out;
+}
+function postes(m){
+  const B=byPost(S.month,S.q);
+  m.append(el("h2",{},`Postes, ${QN[S.q].toLowerCase()}`),el("p",{class:"lead"},`${monthName(S.month)}. Classés par note moyenne sur les parties jouées à ce poste (${D.minGames} parties minimum pour être classé).`));
+  const team=POSTES.map(([k,n])=>{ let p=B[k].find(a=>a.n>=D.minGames), few=false; if(!p&&B[k].length){ p=B[k].slice().sort((a,b)=>b.note-a.note)[0]; few=true; } return {k,n,p,few}; });
+  m.append(el("div",{class:"qtitle",style:"margin-top:0"},"Équipe type du mois"),el("div",{class:"dream"},team.map(({n,p,few})=>el(p?"button":"div",{class:"dcard",onclick:p?()=>openProfile(p.pu):null,style:p?`background-image:linear-gradient(180deg,rgba(12,24,32,.15),rgba(12,24,32,.95) 75%),url('${splash(p.top)}')`:""},
+    el("span",{class:"dpos"},n),p?[avatar(p.pu),el("b",{},P[p.pu].name),el("small",{},`${fmt(p.note,1)} de note, ${pl(p.n,"partie","parties")}${few?" (provisoire)":""}`),
+      MULTI&&P[p.pu].structs?.[0]?el("small",{class:"gold"},SBY[P[p.pu].structs[0]]?.tag||""):null]:el("small",{class:"mut"},"Personne")))));
+  for(const [k,n] of POSTES){ const L=B[k]; if(!L.length) continue;
+    m.append(el("div",{class:"qtitle"},n),el("div",{class:"table"},L.slice(0,10).map((a,i)=>{ const ok=a.n>=D.minGames;
+      return el("button",{class:`row${ok&&i<3?" r"+(i+1):""}${ok?"":" out"}`,onclick:()=>openProfile(a.pu)},el("div",{class:"rk"},ok?i+1:"–"),
+        el("div",{},el("div",{class:"pl"},avatar(a.pu),el("div",{},el("div",{class:"n"},P[a.pu].name),
+            MULTI?el("span",{class:"tier mut"},(P[a.pu].structs||[]).map(s=>SBY[s]?.nom).join(", ")):tierTxt(P[a.pu].ranks?.[S.q]))),
+          el("div",{class:"strip"},el("span",{},el("b",{},`${a.w}-${a.n-a.w}`),"V-D"),el("span",{},el("b",{},fmt(a.kda,2)),"KDA"),el("span",{},el("b",{},a.top),"le plus joué"))),
+        el("div",{class:"score"},el("b",{},fmt(a.note,1)),el("small",{},"note"))); }))); }
+}
+
+/* ---------- recrutement ---------- */
+function recrut(m){
+  const R=structPoints(S.month); const L=STS.filter(s=>s.recrutement);
+  m.append(el("h2",{},"Recrutement"),el("p",{class:"lead"},"Les structures qui cherchent des joueurs en ce moment. Contacte-les sur leur Discord."));
+  if(!L.length){ m.append(el("p",{class:"empty-state"},"Aucune structure ne recrute pour l'instant.")); return; }
+  m.append(el("div",{class:"recs"},L.map(st=>{ const r=R.findIndex(x=>x.st.id===st.id)+1;
+    return el("div",{class:"recc",style:`--c:${st.couleur}`},el("div",{class:"rh"},logo(st,56),el("div",{},el("b",{},st.nom),el("div",{class:"mut",style:"font-size:13px"},`${st.membres.length} joueurs, ${ord(r)} au classement du mois`))),
+      el("div",{class:"rl"},el("span",{class:"mut"},"Postes recherchés"),el("div",{class:"chipsr"},(st.postes_recherches?.length?st.postes_recherches:["Tous"]).map(x=>el("span",{},POS[x]||x)))),
+      st.niveau?el("div",{class:"rl"},el("span",{class:"mut"},"Niveau"),el("b",{},st.niveau)):null,
+      st.contact?el("div",{class:"rl"},el("span",{class:"mut"},"Contact"),el("span",{},st.contact)):null,
+      el("div",{class:"links"},st.discord?el("a",{class:"btn gold",href:st.discord,target:"_blank",rel:"noopener"},"Rejoindre le Discord"):null,
+        el("button",{class:"btn",onclick:()=>{setScope(st.id); render(); scrollTo(0,0);}},"Voir la structure"))); })));
+}
+
+/* ---------- agenda ---------- */
+function agenda(m){
+  const today=new Date(); today.setHours(0,0,0,0);
+  const L=(D.agenda||[]).filter(x=>S.scope==="league"||x.a===S.scope||x.b===S.scope).filter(x=>dayStart(x.date)>=today.getTime())
+    .sort((a,b)=>(a.date+(a.heure||"")).localeCompare(b.date+(b.heure||"")));
+  m.append(el("h2",{},"Agenda"),el("p",{class:"lead"},"Les prochains scrims et matchs entre structures. Un rappel part sur Discord la veille."));
+  if(!L.length){ m.append(el("p",{class:"empty-state"},"Rien de prévu pour l'instant.")); return; }
+  let last="";
+  for(const x of L){ if(x.date!==last){ last=x.date; m.append(el("div",{class:"qtitle"},cap(dfmt(x.date,{weekday:"long",day:"numeric",month:"long"})))); }
+    m.append(el("div",{class:"match"},el("div",{class:"md"},el("b",{class:"num",style:"font-size:20px"},x.heure||"–"),el("br"),el("span",{class:"mut"},x.type||"")),
+      el("div",{class:"side a w"},el("span",{},SBY[x.a]?.nom||x.a),logo(SBY[x.a],34)),el("div",{class:"sc2",style:"font-size:18px;color:var(--gold)"},"VS"),
+      el("div",{class:"side b w"},logo(SBY[x.b],34),el("span",{},SBY[x.b]?.nom||x.b)),
+      x.note?el("div",{class:"mut",style:"grid-column:1/-1;font-size:13px"},x.note):null)); }
+}
+
+/* ---------- stats d'équipe ---------- */
+function teamStats(t){
+  const ids=t.joueurs.map(j=>j.puuid).filter(Boolean); if(ids.length<2) return null;
+  const starters=t.joueurs.filter(j=>j.puuid&&(!j.role||j.role==="titulaire")).map(j=>j.puuid);
+  const pos=Object.fromEntries(t.joueurs.filter(j=>j.puuid).map(j=>[j.puuid,j.poste]));
+  const pairs={}; let full=0,fullW=0;
+  for(const g of gamesFor(S.month,null)){ const here=g.parts.filter(p=>p.friend&&ids.includes(p.puuid));
+    for(let i=0;i<here.length;i++) for(let j=i+1;j<here.length;j++){ if(here[i].team!==here[j].team) continue;
+      const k=[here[i].puuid,here[j].puuid].sort().join("|"); const r=(pairs[k]??={n:0,w:0}); r.n++; r.w+=here[i].win?1:0; }
+    if(g.q==="flex"&&starters.length>=5){ const st=here.filter(p=>starters.includes(p.puuid)); if(st.length>=5&&st.every(p=>p.team===st[0].team)){ full++; fullW+=st[0].win?1:0; } } }
+  const LANES=[["TOP","JUNGLE","Top + jungle"],["MIDDLE","JUNGLE","Mid + jungle"],["BOTTOM","UTILITY","Duo bot"]];
+  const lane=LANES.map(([a,b,n])=>{ const pa=ids.find(i=>pos[i]===a&&starters.includes(i)), pb=ids.find(i=>pos[i]===b&&starters.includes(i)); if(!pa||!pb) return null;
+    const r=pairs[[pa,pb].sort().join("|")]||{n:0,w:0}; return {lab:n,pa,pb,...r}; }).filter(Boolean);
+  const best=Object.entries(pairs).filter(([,r])=>r.n>=2).sort((a,b)=>b[1].w/b[1].n-a[1].w/a[1].n||b[1].n-a[1].n).slice(0,3);
+  return el("div",{class:"tstats"},
+    el("div",{class:"tile"},el("b",{},full?`${fmt(fullW/full*100)} %`:"–"),el("span",{},full?`de victoires quand les 5 titulaires jouent ensemble en flex (${full} parties)`:"les 5 titulaires n'ont pas encore joué ensemble en flex")),
+    lane.map(l=>el("div",{class:"tile"},el("b",{},l.n?`${fmt(l.w/l.n*100)} %`:"–"),el("span",{},`${l.lab} : ${P[l.pa].name} et ${P[l.pb].name}, ${l.n?`${l.n} partie${l.n>1?"s":""} ensemble`:"jamais ensemble"}`))),
+    best.length?el("div",{class:"tile wide"},el("span",{},"Meilleurs duos de l'équipe"),best.map(([k,r])=>{ const [a,b]=k.split("|"); return el("div",{},el("b",{style:"font-size:17px"},`${P[a].name} + ${P[b].name}`),` ${fmt(r.w/r.n*100)} % sur ${r.n} parties`); })):null);
+}
+
+/* ---------- fiche joueur publique ---------- */
+const slug=p=>(p.name+"-"+p.tag).toLowerCase().normalize("NFD").replace(/[̀-ͯ]/g,"").replace(/[^a-z0-9]+/g,"-").replace(/^-|-$/g,"");
+function withAll(fn){ const a=PL,b=SC; PL=ALL; SC=new Set(ALL.map(p=>p.puuid)); try{ return fn(); } finally{ PL=a; SC=b; } }
+function palmares(pu){
+  return withAll(()=>{ const out=[];
+    for(const mo of months) for(const q of ["solo","flex"]){ const R=ranked(aggregate(mo,q)); if(!R.length) continue;
+      for(const x of R){ x.mk=x.penta*100+x.quadra*10+x.triple; x.otp=x.topChamp?.[1]||0; }
+      for(const [e,n,type,key,dir] of TROPHIES){ const l=R.filter(z=>(z[key]||0)!==0||dir<0).sort((u,v)=>(v[key]-u[key])*dir); if(l[0]?.puuid===pu) out.push({e,n,type,mo,q}); } }
+    return out; });
+}
+function openFromHash(){ const m=location.hash.match(/^#j-(.+)$/); if(!m) return false; const p=ALL.find(x=>slug(x)===m[1]); if(p) openProfile(p.puuid); return !!p; }
+
+/* =====================================================================
+   PANNEAU D'ADMIN (#admin) : modifie config.json directement sur GitHub
+   ===================================================================== */
+const LS={get:k=>{try{return localStorage.getItem(k)||"";}catch(e){return "";}},set:(k,v)=>{try{localStorage.setItem(k,v);}catch(e){}}};
+const AD={owner:LS.get("lp_owner")||(location.hostname.endsWith(".github.io")?location.hostname.split(".")[0]:""),
+  repo:LS.get("lp_repo")||(location.hostname.endsWith(".github.io")?(location.pathname.split("/")[1]||""):""),
+  token:LS.get("lp_token"),cfg:null,sha:null,dirty:false,msg:"",err:false,edit:"",busy:false};
+const cfgText=()=>JSON.stringify(AD.cfg,(k,v)=>k.startsWith("_")?undefined:v,2);
+const AOPEN={};
+const acard=(key,title,def,...kids)=>el("details",{class:"acard",open:(AOPEN[key]??def)||null,ontoggle:e=>AOPEN[key]=e.target.open},el("summary",{},title),...kids);
+const b64e=s=>{ const b=new TextEncoder().encode(s); let out=""; for(let i=0;i<b.length;i+=0x8000) out+=String.fromCharCode(...b.subarray(i,i+0x8000)); return btoa(out); };
+const b64d=b=>new TextDecoder().decode(Uint8Array.from(atob(b.replace(/\s/g,"")),c=>c.charCodeAt(0)));
+const API=p=>`https://api.github.com/repos/${AD.owner}/${AD.repo}${p}`;
+const hdr=()=>({"Accept":"application/vnd.github+json",...(AD.token?{"Authorization":"Bearer "+AD.token}:{}),"X-GitHub-Api-Version":"2022-11-28"});
+function adMsg(t,err){ AD.msg=t; AD.err=!!err; render(); }
+async function adLoad(){
+  if(!AD.owner||!AD.repo) return adMsg("Indique ton pseudo GitHub et le nom du référentiel.",true);
+  LS.set("lp_owner",AD.owner); LS.set("lp_repo",AD.repo); LS.set("lp_token",AD.token);
+  AD.busy=true; adMsg("Chargement de config.json…");
+  try{
+    if(AD.token){ const r=await fetch(API("/contents/config.json"),{headers:hdr(),cache:"no-store"});
+      if(r.status===401) throw new Error("jeton refusé (vérifie qu'il est copié en entier et pas expiré)");
+      if(r.status===404) throw new Error("config.json introuvable (vérifie le pseudo, le référentiel et que le jeton a accès à ce référentiel)");
+      if(!r.ok) throw new Error("GitHub a répondu "+r.status);
+      const j=await r.json(); AD.sha=j.sha; AD.cfg=JSON.parse(b64d(j.content)); }
+    else { const r=await fetch(`https://raw.githubusercontent.com/${AD.owner}/${AD.repo}/main/config.json?t=${Date.now()}`);
+      if(!r.ok) throw new Error("config.json introuvable ("+r.status+")"); AD.cfg=JSON.parse(await r.text()); AD.sha=null; }
+    AD.cfg.structures??=[]; AD.cfg.matchs??=[]; AD.cfg.duels??=[]; AD.cfg.joueurs??=[];
+    AD.dirty=false; AD.busy=false; adMsg(AD.token?"config.json chargé. Tu peux modifier puis enregistrer.":"config.json chargé en lecture seule : ajoute ton jeton GitHub pour pouvoir enregistrer.");
+  }catch(e){ AD.busy=false; adMsg("Impossible de charger : "+e.message,true); }
+}
+function adCheck(){
+  const c=AD.cfg, errs=[], ids=new Set();
+  for(const s of c.structures){ if(!/^[a-z0-9-]+$/.test(s.id||"")) errs.push(`Structure « ${s.nom} » : l'identifiant doit être en minuscules, sans espace ni accent.`);
+    if(ids.has(s.id)) errs.push(`Identifiant en double : ${s.id}`); ids.add(s.id);
+    for(const t of s.equipes||[]) for(const j of t.joueurs||[]) if(!String(j.riot||"").includes("#")) errs.push(`« ${j.riot||"(vide)"} » dans ${s.nom} : il faut le Riot ID complet (Pseudo#TAG).`);
+    for(const r of s.membres||[]) if(!String(r).includes("#")) errs.push(`« ${r} » dans ${s.nom} : il faut le Riot ID complet (Pseudo#TAG).`); }
+  for(const m of c.matchs) if(!ids.has(m.a)||!ids.has(m.b)) errs.push(`Un match du ${m.date} vise une structure qui n'existe plus.`);
+  return errs;
+}
+async function adSave(){
+  const errs=adCheck(); if(errs.length) return adMsg("À corriger avant d'enregistrer : "+errs.join(" "),true);
+  if(!AD.token) return adMsg("Il faut ton jeton GitHub pour enregistrer (section Connexion).",true);
+  AD.busy=true; adMsg("Enregistrement sur GitHub…");
+  try{ const r=await fetch(API("/contents/config.json"),{method:"PUT",headers:{...hdr(),"Content-Type":"application/json"},
+      body:JSON.stringify({message:"Admin : mise à jour de la ligue",content:b64e(cfgText()+"\n"),sha:AD.sha})});
+    if(r.status===409) throw new Error("le fichier a changé entre-temps : recharge-le puis refais ta modification");
+    if(r.status===403||r.status===401) throw new Error("le jeton n'a pas le droit d'écrire (permission « Contents : Read and write »)");
+    if(!r.ok) throw new Error("GitHub a répondu "+r.status);
+    const j=await r.json(); AD.sha=j.content.sha; AD.dirty=false; AD.busy=false;
+    adMsg("Enregistré ✓ Le site sera à jour à la prochaine mise à jour automatique (10 min au plus), ou tout de suite avec « Mettre à jour le site ».");
+  }catch(e){ AD.busy=false; adMsg("Échec de l'enregistrement : "+e.message,true); }
+}
+async function adRun(){
+  if(!AD.token) return adMsg("Il faut ton jeton GitHub.",true);
+  try{ const r=await fetch(API("/actions/workflows/maj.yml/dispatches"),{method:"POST",headers:{...hdr(),"Content-Type":"application/json"},body:JSON.stringify({ref:"main"})});
+    if(r.status===403||r.status===401) throw new Error("le jeton n'a pas le droit de lancer les mises à jour (permission « Actions : Read and write »)");
+    if(r.status!==204) throw new Error("GitHub a répondu "+r.status);
+    adMsg("Mise à jour lancée ✓ Le site sera à jour dans 2 à 5 minutes (recharge la page ensuite).");
+  }catch(e){ adMsg("Impossible de lancer la mise à jour : "+e.message,true); }
+}
+const chg=f=>e=>{ f(e.target.type==="checkbox"?e.target.checked:e.target.value); AD.dirty=true; render(); };
+const fld=(label,input,hint)=>el("label",{class:"af"},el("span",{},label),input,hint?el("small",{},hint):null);
+const inp=(val,on,attrs={})=>el("input",{value:val??"",onchange:chg(on),...attrs});
+const stSel=(val,on,empty)=>{ const s=el("select",{onchange:chg(on)},empty?el("option",{value:""},empty):null,AD.cfg.structures.map(x=>el("option",{value:x.id},x.nom))); s.value=val||""; return s; };
+const postSel=(val,on)=>{ const s=el("select",{onchange:chg(on)},el("option",{value:""},"–"),POSTES.map(([k,n])=>el("option",{value:k},n))); s.value=val||""; return s; };
+const stName=id=>AD.cfg.structures.find(s=>s.id===id)?.nom||id;
+let NM={date:new Date().toISOString().slice(0,10),heure:"",a:"",b:"",sa:"",sb:"",type:"Scrim BO3",note:""};
+let ND={a:"",b:"",debut:new Date().toISOString().slice(0,10),fin:new Date(Date.now()+6*864e5).toISOString().slice(0,10),titre:""};
+function admin(m){
+  m.append(el("h2",{},"Panneau d'admin"),el("p",{class:"lead"},"Ajoute des matchs, des événements d'agenda, des duels et des structures. « Enregistrer » met à jour config.json sur GitHub : le site suit à la mise à jour suivante."));
+  // connexion
+  m.append(acard("cx",AD.cfg?"Connexion ✓":"Connexion",!AD.cfg,
+    el("div",{class:"agrid"},fld("Pseudo GitHub",inp(AD.owner,v=>AD.owner=v.trim())),fld("Référentiel",inp(AD.repo,v=>AD.repo=v.trim())),
+      fld("Jeton GitHub",inp(AD.token,v=>AD.token=v.trim(),{type:"password",autocomplete:"off"}),"Gardé seulement dans ce navigateur, jamais envoyé ailleurs que sur GitHub.")),
+    el("div",{class:"links"},el("button",{class:"btn gold",onclick:adLoad},AD.cfg?"Recharger config.json":"Se connecter"),
+      AD.token?el("button",{class:"btn",onclick:()=>{AD.token=""; LS.set("lp_token",""); render();}},"Oublier le jeton"):null),
+    el("details",{style:"margin-top:10px"},el("summary",{class:"mut"},"Comment créer le jeton (une seule fois)"),
+      el("ol",{class:"steps"},el("li",{},"GitHub → ta photo en haut à droite → Settings → Developer settings (tout en bas) → Personal access tokens → Fine-grained tokens → Generate new token."),
+        el("li",{},"Nom : « admin ligue ». Expiration : 1 an. Repository access : Only select repositories → lol-potes."),
+        el("li",{},"Permissions → Repository permissions : Contents → Read and write, et Actions → Read and write."),
+        el("li",{},"Generate token, copie-le et colle-le ici. Ne le partage avec personne.")))));
+  if(!AD.cfg){ return; }
+  const c=AD.cfg;
+  // matchs et agenda
+  const mlist=c.matchs.map((x,i)=>({x,i})).sort((a,b)=>String(b.x.date).localeCompare(String(a.x.date)));
+  m.append(acard("m",`Matchs et agenda (${c.matchs.length})`,true,
+    el("p",{class:"mut"},"Avec un score : c'est un résultat (onglet Matchs). Sans score : c'est un événement à venir (onglet Agenda, rappel Discord la veille). Tu pourras ajouter le score plus tard."),
+    el("div",{class:"agrid"},fld("Date",el("input",{type:"date",value:NM.date,onchange:e=>NM.date=e.target.value})),fld("Heure (facultatif)",el("input",{type:"time",value:NM.heure,onchange:e=>NM.heure=e.target.value})),
+      fld("Structure A",(()=>{const s=el("select",{onchange:e=>NM.a=e.target.value},el("option",{value:""},"Choisir"),c.structures.map(x=>el("option",{value:x.id},x.nom))); s.value=NM.a; return s;})()),
+      fld("Structure B",(()=>{const s=el("select",{onchange:e=>NM.b=e.target.value},el("option",{value:""},"Choisir"),c.structures.map(x=>el("option",{value:x.id},x.nom))); s.value=NM.b; return s;})()),
+      fld("Score A",el("input",{type:"number",min:0,value:NM.sa,onchange:e=>NM.sa=e.target.value})),fld("Score B",el("input",{type:"number",min:0,value:NM.sb,onchange:e=>NM.sb=e.target.value})),
+      fld("Type",el("input",{list:"mtypes",value:NM.type,onchange:e=>NM.type=e.target.value})),fld("Note (facultatif)",el("input",{value:NM.note,onchange:e=>NM.note=e.target.value}))),
+    el("datalist",{id:"mtypes"},["Scrim BO1","Scrim BO3","Scrim BO5","Officiel BO1","Officiel BO3","Officiel BO5","Amical"].map(v=>el("option",{value:v}))),
+    el("button",{class:"btn gold",onclick:()=>{ if(!NM.a||!NM.b||NM.a===NM.b) return adMsg("Choisis deux structures différentes.",true); if(!NM.date) return adMsg("Indique la date.",true);
+      const x={date:NM.date,a:NM.a,b:NM.b,type:NM.type}; if(NM.heure) x.heure=NM.heure; if(NM.note) x.note=NM.note; if(NM.sa!==""&&NM.sb!=="") x.score=`${NM.sa}-${NM.sb}`;
+      c.matchs.push(x); AD.dirty=true; NM={...NM,sa:"",sb:"",note:""}; adMsg(x.score?"Résultat ajouté (pense à enregistrer).":"Événement ajouté à l'agenda (pense à enregistrer)."); }},"Ajouter"),
+    el("div",{class:"alist"},mlist.map(({x,i})=>el("div",{class:"arow"},el("span",{class:"mut"},`${x.date}${x.heure?" "+x.heure:""}`),
+      el("b",{},`${stName(x.a)} ${x.score?x.score.replace("-"," - "):"vs"} ${stName(x.b)}`),el("span",{class:"mut"},x.type||""),
+      !x.score&&!x._edit?el("button",{class:"btn sm",onclick:()=>{ x._edit=true; render(); }},"Saisir le score"):null,
+      x._edit?el("span",{class:"inl"},el("input",{type:"number",min:0,placeholder:"A",id:"sa"+i,style:"width:56px"}),el("input",{type:"number",min:0,placeholder:"B",id:"sb"+i,style:"width:56px"}),
+        el("button",{class:"btn sm gold",onclick:()=>{ const a=$("sa"+i).value,b=$("sb"+i).value; if(a===""||b==="") return; x.score=`${a}-${b}`; delete x._edit; AD.dirty=true; render(); }},"OK")):null,
+      el("button",{class:"btn sm ghost",onclick:()=>{ c.matchs.splice(i,1); AD.dirty=true; render(); }},"Supprimer"))))));
+  // duels
+  m.append(acard("d",`Duels de structures (${c.duels.length})`,false,
+    el("div",{class:"agrid"},fld("Structure A",(()=>{const s=el("select",{onchange:e=>ND.a=e.target.value},el("option",{value:""},"Choisir"),c.structures.map(x=>el("option",{value:x.id},x.nom))); s.value=ND.a; return s;})()),
+      fld("Structure B",(()=>{const s=el("select",{onchange:e=>ND.b=e.target.value},el("option",{value:""},"Choisir"),c.structures.map(x=>el("option",{value:x.id},x.nom))); s.value=ND.b; return s;})()),
+      fld("Début",el("input",{type:"date",value:ND.debut,onchange:e=>ND.debut=e.target.value})),fld("Fin (incluse)",el("input",{type:"date",value:ND.fin,onchange:e=>ND.fin=e.target.value})),
+      fld("Titre (facultatif)",el("input",{value:ND.titre,onchange:e=>ND.titre=e.target.value}))),
+    el("button",{class:"btn gold",onclick:()=>{ if(!ND.a||!ND.b||ND.a===ND.b) return adMsg("Choisis deux structures différentes.",true); if(ND.fin<ND.debut) return adMsg("La fin doit être après le début.",true);
+      const d={a:ND.a,b:ND.b,debut:ND.debut,fin:ND.fin}; if(ND.titre) d.titre=ND.titre; c.duels.push(d); AD.dirty=true; adMsg("Duel ajouté (pense à enregistrer)."); }},"Ajouter le duel"),
+    el("div",{class:"alist"},c.duels.map((d,i)=>el("div",{class:"arow"},el("span",{class:"mut"},`${d.debut} → ${d.fin}`),el("b",{},`${stName(d.a)} vs ${stName(d.b)}`),el("span",{class:"mut"},d.titre||""),
+      el("button",{class:"btn sm ghost",onclick:()=>{ c.duels.splice(i,1); AD.dirty=true; render(); }},"Supprimer"))))));
+  // structures
+  const cur=c.structures.find(s=>s.id===AD.edit);
+  m.append(acard("s",`Structures (${c.structures.length})`,!!AD.edit,
+    el("div",{class:"links"},c.structures.map(s=>el("button",{class:"btn"+(s.id===AD.edit?" gold":""),onclick:()=>{AD.edit=s.id; AOPEN.s=true; render();}},s.nom)),
+      el("button",{class:"btn",onclick:()=>{ let n=1; while(c.structures.some(s=>s.id==="structure-"+n)) n++; c.structures.push({id:"structure-"+n,nom:"Nouvelle structure",tag:"NEW",couleur:"#3cc7bf",logo:"",description:"",discord:"",recrutement:false,reseaux:{},postes_recherches:[],niveau:"",contact:"",equipes:[],membres:[]}); AD.edit="structure-"+n; AD.dirty=true; render(); }},"+ Nouvelle structure")),
+    cur?structEditor(cur):el("p",{class:"mut"},"Choisis une structure à modifier.")));
+  // joueurs hors structure + réglages + barème
+  m.append(acard("j",`Joueurs suivis hors structure (${c.joueurs.length})`,false,
+    el("div",{class:"alist"},c.joueurs.map((r,i)=>el("div",{class:"arow"},el("b",{},r),el("button",{class:"btn sm ghost",onclick:()=>{ c.joueurs.splice(i,1); AD.dirty=true; render(); }},"Retirer")))),
+    el("div",{class:"inl"},el("input",{id:"newj",placeholder:"Pseudo#TAG"}),el("button",{class:"btn",onclick:()=>{ const v=$("newj").value.trim(); if(!v.includes("#")) return adMsg("Il faut le Riot ID complet : Pseudo#TAG.",true); c.joueurs.push(v); AD.dirty=true; render(); }},"Ajouter"))));
+  c.points??={...PTS};
+  const PN=[["victoire","Victoire"],["defaite","Défaite"],["bonne_partie","Note de 8 ou plus"],["partie_parfaite","Partie parfaite"],["quadra","Quadrakill"],["penta","Pentakill"],["max_parties_par_jour","Parties max par jour"],["membres_comptes","Membres comptés"]];
+  m.append(acard("r","Réglages de la ligue et barème des points",false,
+    el("div",{class:"agrid"},fld("Nom de la ligue",inp(c.nom_ligue,v=>c.nom_ligue=v)),fld("Adresse du site",inp(c.site_url,v=>c.site_url=v)),
+      fld("Mois récupérés",inp(c.mois,v=>c.mois=+v||1,{type:"number",min:1,max:12})),fld("Parties min. pour être classé",inp(c.min_parties_classement,v=>c.min_parties_classement=+v||1,{type:"number",min:1}))),
+    el("div",{class:"agrid"},PN.map(([k,n])=>fld(n,inp(c.points[k]??PTS[k],v=>c.points[k]=+v||0,{type:"number",min:0}))))));
+  // barre d'enregistrement
+  m.append(el("div",{class:"savebar"},el("div",{class:"wrap"},
+    el("span",{class:AD.err?"loss":AD.dirty?"gold":"mut"},AD.msg||(AD.dirty?"Modifications non enregistrées.":"Rien à enregistrer.")),
+    el("div",{class:"links",style:"margin:0"},el("button",{class:"btn gold",disabled:!AD.dirty||AD.busy,onclick:adSave},"Enregistrer sur GitHub"),
+      el("button",{class:"btn",onclick:adRun,disabled:AD.busy},"Mettre à jour le site"),
+      el("button",{class:"btn ghost",onclick:e=>navigator.clipboard?.writeText(cfgText()).then(()=>e.target.textContent="JSON copié ✓")},"Copier le JSON")))));
+}
+function structEditor(s){
+  const c=AD.cfg; s.equipes??=[]; s.membres??=[]; s.postes_recherches??=[]; s.reseaux??={};
+  return el("div",{class:"sedit"},
+    el("div",{class:"agrid"},fld("Identifiant (lien #s-…)",inp(s.id,v=>{ const nv=v.toLowerCase().normalize("NFD").replace(/[̀-ͯ]/g,"").replace(/[^a-z0-9]+/g,"-").replace(/^-|-$/g,"");
+        for(const m of c.matchs){ if(m.a===s.id) m.a=nv; if(m.b===s.id) m.b=nv; } for(const d of c.duels){ if(d.a===s.id) d.a=nv; if(d.b===s.id) d.b=nv; } s.id=nv; AD.edit=nv; }),"minuscules, sans espace"),
+      fld("Nom",inp(s.nom,v=>s.nom=v)),fld("Tag (3 lettres)",inp(s.tag,v=>s.tag=v.toUpperCase().slice(0,4))),fld("Couleur",inp(s.couleur||"#3cc7bf",v=>s.couleur=v,{type:"color"})),
+      fld("Logo (lien d'image)",inp(s.logo,v=>s.logo=v.trim()),"Clic droit sur le logo dans Discord → Copier le lien de l'image"),fld("Lien d'invitation Discord",inp(s.discord,v=>s.discord=v.trim()))),
+    fld("Description",el("textarea",{rows:2,onchange:chg(v=>s.description=v)},s.description||"")),
+    el("div",{class:"agrid"},fld("Recrute",el("input",{type:"checkbox",checked:!!s.recrutement,onchange:chg(v=>s.recrutement=v)})),
+      fld("Niveau recherché",inp(s.niveau,v=>s.niveau=v)),fld("Contact",inp(s.contact,v=>s.contact=v))),
+    el("div",{class:"af"},el("span",{},"Postes recherchés"),el("div",{class:"links",style:"margin:0"},POSTES.map(([k,n])=>el("label",{class:"chk"},el("input",{type:"checkbox",checked:s.postes_recherches.includes(k),
+      onchange:chg(v=>{ s.postes_recherches=s.postes_recherches.filter(x=>x!==k); if(v) s.postes_recherches.push(k); })}),n)))),
+    el("h4",{},"Équipes"),
+    s.equipes.map((t,ti)=>el("div",{class:"tedit"},el("div",{class:"agrid"},fld("Nom de l'équipe",inp(t.nom,v=>t.nom=v)),fld("Coach",inp(t.coach,v=>t.coach=v))),
+      (t.joueurs||=[]).map((j,ji)=>el("div",{class:"inl"},inp(j.riot,v=>j.riot=v.trim(),{placeholder:"Pseudo#TAG"}),postSel(j.poste,v=>j.poste=v),
+        (()=>{ const r=el("select",{onchange:chg(v=>j.role=v)},["titulaire","remplaçant"].map(x=>el("option",{value:x},x))); r.value=j.role||"titulaire"; return r; })(),
+        el("button",{class:"btn sm ghost",onclick:()=>{ t.joueurs.splice(ji,1); AD.dirty=true; render(); }},"✕"))),
+      el("div",{class:"links"},el("button",{class:"btn sm",onclick:()=>{ t.joueurs.push({riot:"",poste:"",role:"titulaire"}); AD.dirty=true; render(); }},"+ Joueur"),
+        el("button",{class:"btn sm ghost",onclick:()=>{ if(confirm?.(`Supprimer l'équipe « ${t.nom} » ?`)??true){ s.equipes.splice(ti,1); AD.dirty=true; render(); } }},"Supprimer l'équipe")))),
+    el("button",{class:"btn",onclick:()=>{ s.equipes.push({nom:"Équipe "+(s.equipes.length+1),coach:"",joueurs:[]}); AD.dirty=true; render(); }},"+ Équipe"),
+    el("h4",{},"Autres membres (hors équipe)"),
+    el("div",{class:"alist"},s.membres.map((r,i)=>el("div",{class:"arow"},el("b",{},r),el("button",{class:"btn sm ghost",onclick:()=>{ s.membres.splice(i,1); AD.dirty=true; render(); }},"Retirer")))),
+    el("div",{class:"inl"},el("input",{id:"newm",placeholder:"Pseudo#TAG"}),el("button",{class:"btn",onclick:()=>{ const v=$("newm").value.trim(); if(!v.includes("#")) return adMsg("Il faut le Riot ID complet : Pseudo#TAG.",true); s.membres.push(v); AD.dirty=true; render(); }},"Ajouter")),
+    el("div",{class:"links",style:"margin-top:18px"},el("button",{class:"btn ghost loss",onclick:()=>{ const used=c.matchs.some(m=>m.a===s.id||m.b===s.id)||c.duels.some(d=>d.a===s.id||d.b===s.id);
+      if(used) return adMsg("Cette structure a des matchs ou des duels : supprime-les d'abord.",true); c.structures.splice(c.structures.indexOf(s),1); AD.edit=""; AD.dirty=true; render(); }},"Supprimer la structure")));
+}
+
+/* ---------- le coach ---------- */
+const CKEY={early_deaths:["Morts en début de partie","d14",-1,"morts avant 14 min",()=>2],isolated:["Morts loin de l'équipe","alone",-1,"morts sans allié proche",()=>1],
+  enemy_jungle:["Morts dans la jungle adverse","ejg",-1,"morts dans la jungle adverse",()=>0],costly_deaths:["Morts qui coûtent des objectifs","costly",-1,"morts suivies d'un objectif perdu",()=>0],
+  cs:["Farm à 10 min","cs10",1,"CS à 10 min",m=>m.cs10t],lane_lost:["Lanes perdues","gd15",1,"or à 15 min face à l'adversaire",()=>0],lead_thrown:["Avances gâchées",null],
+  vision:["Vision","vpm",1,"de vision par minute",m=>m.vpmt],control_wards:["Balises de contrôle","cw",1,"balises de contrôle par partie",m=>m.cwt],
+  kp:["Présence en combat","kp",1,"% de participation aux kills",m=>m.kpt],damage:["Dégâts en combat",null],first_item:["Premier objet","first",-1,"min pour le premier objet fini",()=>14],
+  plates:["Plaques de tour",null]};
+const GCOL={S:"var(--gold)",A:"var(--teal)",B:"#6fb3ff",C:"var(--mut)",D:"var(--red)"};
+function coachCard(g,f){
+  const p=g.parts.find(x=>x.pid===f.pid), c=f.coach;
+  const head=el("div",{class:"h"},champImg(p.champ),el("div",{style:"flex:1"},el("b",{},p.name),el("div",{class:"mut",style:"font-size:13px"},`${POS[f.pos]||""}, ${p.k}/${p.d}/${p.a}, note ${fmt(p.score,1)}`)),
+    c?el("span",{class:"grade",style:`--g:${GCOL[c.grade]}`},c.grade):null);
+  const mini=el("div",{class:"mini"},el("div",{},el("b",{},f.cs10??"–"),"CS à 10 min",f.csOpp10!=null?el("div",{},`adversaire ${f.csOpp10}`):null),
+    el("div",{},el("b",{class:f.gd10>=0?"win":"loss"},f.gd10!=null?(f.gd10>0?"+":"")+fmt(f.gd10):"–"),"or à 10 min",f.opp?el("div",{},"contre "+f.opp):null),
+    el("div",{},el("b",{class:f.gd15>=0?"win":"loss"},f.gd15!=null?(f.gd15>0?"+":"")+fmt(f.gd15):"–"),"or à 15 min"));
+  if(!c) return el("div",{class:"fcard"},head,mini,f.tips?.length?el("ul",{class:"tips"},f.tips.map(t=>el("li",{},t))):null);
+  const bar=w=>{ if(w.val==null||w.target==null||typeof w.val!=="number") return null; const lower=["early_deaths","isolated","enemy_jungle","costly_deaths","first_item"].includes(w.key);
+    const max=Math.max(Math.abs(w.val),Math.abs(w.target))*1.25||1, pv=Math.max(0,Math.min(100,Math.abs(w.val)/max*100)), pt=Math.max(0,Math.min(100,Math.abs(w.target)/max*100));
+    return el("div",{class:"cbar",title:`toi : ${w.val}${w.unit||""}, objectif : ${w.target}${w.unit||""}`},el("i",{style:`width:${pv}%;background:${lower?"var(--red)":"var(--gold)"}`}),el("em",{style:`left:${pt}%`})); };
+  return el("div",{class:"fcard coach"},head,mini,
+    c.good.length?el("div",{class:"cblock"},el("div",{class:"ct good"},"Ce qui a marché"),el("ul",{class:"tips"},c.good.map(t=>el("li",{},t)))):null,
+    c.work.length?el("div",{class:"cblock"},el("div",{class:"ct work"},"À travailler"),c.work.map(w=>el("div",{class:"witem"},el("b",{},w.title),bar(w),el("p",{},w.detail)))):null,
+    c.moments.length?el("div",{class:"cblock"},el("div",{class:"ct"},"Moments à revoir dans le replay"),el("div",{class:"moms"},c.moments.map(x=>el("div",{},el("span",{class:"num"},mmss(x.t)),x.txt)))):null,
+    el("div",{class:"drill"},el("span",{},"Pour la prochaine partie"),c.drill));
+}
+const mmss=t=>`${Math.floor(t)}:${String(Math.round((t%1)*60)).padStart(2,"0")}`;
+function coachData(pu,month,q){
+  const L=[]; for(const g of gamesFor(month,q).slice().sort((a,b)=>a.date-b.date)){ const f=g.review?.friends?.find(x=>x.puuid===pu&&x.coach); if(f) L.push({g,f,c:f.coach,m:f.coach.m,p:g.parts.find(x=>x.pid===f.pid)}); }
+  return L;
+}
+function coachSummary(pu,month,q){
+  const L=coachData(pu,month,q), box=el("div",{class:"csum"});
+  if(L.length<2){ box.append(el("p",{class:"empty-state"},L.length?"Encore une partie analysée et le bilan s'affiche.":"Aucune partie avec revue détaillée sur cette période.")); return box; }
+  for(const x of L) x.m.ejg=x.m.zones?.["jungle adverse"]||0;
+  const cnt={}; for(const x of L) for(const k of x.m.keys||[]) cnt[k]=(cnt[k]||0)+1;
+  const pri=Object.entries(cnt).filter(([k])=>CKEY[k]).sort((a,b)=>b[1]-a[1]).slice(0,3);
+  const avg=(arr,k)=>{ const v=arr.map(x=>x.m[k]).filter(v=>v!=null&&isFinite(v)); return v.length?v.reduce((a,b)=>a+b,0)/v.length:null; };
+  const recent=L.slice(-5), before=L.slice(0,-5);
+  const grades={}; for(const x of L) grades[x.c.grade]=(grades[x.c.grade]||0)+1;
+  box.append(el("div",{class:"grades"},el("span",{class:"mut"},`${L.length} parties analysées :`),["S","A","B","C","D"].filter(g=>grades[g]).map(g=>el("span",{class:"grade sm",style:`--g:${GCOL[g]}`},`${g} ×${grades[g]}`))));
+  // plan : 3 priorités
+  box.append(el("div",{class:"qtitle",style:"margin-top:14px"},"Le plan : 3 priorités"));
+  if(!pri.length) box.append(el("p",{},"Aucun défaut récurrent sur cette période : bravo, continue comme ça."));
+  pri.forEach(([k,n],i)=>{ const [title,mk,dir,lab,tf]=CKEY[k]; const r=mk?avg(recent,mk):null, b=mk&&before.length?avg(before,mk):null, exg=L.slice().reverse().find(x=>x.c.work.some(w=>w.key===k)), t=mk?tf((exg||L[L.length-1]).m):null;
+    const trend=r!=null&&b!=null&&Math.abs(r-b)>0.01?((r-b)*dir>0?["▲ en progrès","win"]:["▼ en recul","loss"]):null;
+    const ex=L.slice().reverse().find(x=>x.c.work.some(w=>w.key===k))?.c.work.find(w=>w.key===k);
+    box.append(el("div",{class:"prio"},el("span",{class:"pn"},i+1),el("div",{},el("b",{},title),el("div",{class:"mut",style:"font-size:13px"},`Revient dans ${n} partie${n>1?"s":""} sur ${L.length}`),
+      mk&&r!=null?el("div",{class:"pv"},`Tes 5 dernières parties : `,el("b",{},`${fmt(r,mk==="vpm"?2:1)} ${lab}`),t!=null?` (objectif : ${fmt(t,mk==="vpm"?1:0)})`:"",trend?el("span",{class:trend[1]},` ${trend[0]}`):null):null,
+      ex?el("p",{class:"mut",style:"font-size:13px;margin:4px 0 0"},ex.detail):null))); });
+  // zones de mort
+  const z={}; let tot=0; for(const x of L) for(const [k,v] of Object.entries(x.m.zones||{})){ z[k]=(z[k]||0)+v; tot+=v; }
+  if(tot) box.append(el("div",{class:"qtitle"},"Où tu meurs"),el("div",{class:"zbars"},Object.entries(z).sort((a,b)=>b[1]-a[1]).map(([k,v])=>el("div",{},el("span",{},k),el("i",{style:`width:${v/tot*100}%`}),el("b",{},fmt(v/tot*100)+" %")))));
+  // tilt : résultat après 2 défaites d'affilée
+  const all=gamesFor(month,null).slice().sort((a,b)=>a.date-b.date).map(g=>({g,p:g.parts.find(x=>x.puuid===pu)})).filter(x=>x.p);
+  let after=[],streak=0,lastT=0; for(const x of all){ if(streak>=2&&x.g.date-lastT<4*3600e3) after.push(x.p.win); streak=x.p.win?0:streak+1; lastT=x.g.date+x.g.dur*1000; }
+  const wrAll=all.filter(x=>x.p.win).length/Math.max(1,all.length)*100;
+  if(after.length>=3){ const w=after.filter(Boolean).length/after.length*100;
+    box.append(el("div",{class:"qtitle"},"Gestion du tilt"),el("p",{},`Après 2 défaites d'affilée, tu gagnes `,el("b",{class:w<wrAll-10?"loss":"win"},fmt(w)+" %"),` de tes parties (${after.length} parties), contre ${fmt(wrAll)} % en temps normal. `,
+      w<wrAll-10?"Conseil : après deux défaites, fais une pause de 15 minutes ou passe en normale.":"Tu encaisses bien les défaites, rien à signaler.")); }
+  // champions
+  const ch={}; for(const x of all){ const r=(ch[x.p.champ]??={n:0,w:0}); r.n++; r.w+=x.p.win?1:0; }
+  const cl=Object.entries(ch).filter(([,r])=>r.n>=3).map(([c,r])=>({c,...r,wr:r.w/r.n*100})).sort((a,b)=>b.wr-a.wr);
+  if(cl.length>=2){ const best=cl[0], worst=cl[cl.length-1];
+    box.append(el("div",{class:"qtitle"},"Tes champions"),el("p",{},el("span",{class:"ci"},champImg(best.c)),` À jouer : `,el("b",{},best.c),` (${fmt(best.wr)} % sur ${best.n} parties). `,
+      worst.wr<45?[el("span",{class:"ci"},champImg(worst.c))," À mettre de côté : ",el("b",{},worst.c),` (${fmt(worst.wr)} % sur ${worst.n} parties).`]:null)); }
+  // dernier exercice
+  const last=L[L.length-1]; box.append(el("div",{class:"drill"},el("span",{},"Exercice de la prochaine partie"),last.c.drill));
+  return box;
+}
+function coachTab(m){
+  if(!S.cc||!SC.has(S.cc)) S.cc=PL[0]?.puuid;
+  m.append(el("h2",{},"Le coach"),el("p",{class:"lead"},`${monthName(S.month)}, toutes ranked confondues. Le coach repère ce qui revient d'une partie à l'autre et propose 3 priorités chiffrées. Les objectifs correspondent environ au niveau Or-Platine : ce sont des repères, pas des règles absolues.`),playerChips("cc",false));
+  if(!S.cc){ m.append(el("p",{class:"empty-state"},"Aucun joueur.")); return; }
+  m.append(coachSummary(S.cc,S.month,null));
+  const L=coachData(S.cc,S.month,null).reverse().slice(0,8);
+  if(L.length) m.append(el("div",{class:"qtitle"},"Dernières parties analysées"),el("div",{class:"table"},L.map(({g,c,p})=>el("button",{class:"game",onclick:()=>openReview(g)},
+    el("div",{class:"bar",style:`background:${p.win?"var(--teal)":"var(--red)"}`}),
+    el("div",{},el("div",{class:"meta"},new Date(g.date).toLocaleDateString("fr-FR",{weekday:"short",day:"numeric",month:"short"})),
+      el("div",{class:"ppl"},el("span",{class:"p"},champImg(p.champ),el("span",{class:"num"},`${p.k}/${p.d}/${p.a}`),el("span",{class:"mut"},c.work[0]?.title||"rien à signaler")))),
+    el("span",{class:"grade",style:`--g:${GCOL[c.grade]}`},c.grade)))));
 }
 
 /* ---------- graphiques : outils SVG ---------- */
@@ -1272,7 +2388,7 @@ function periodBounds(){
 function dayTicks(a,b){ const t=[]; const span=b-a, narrow=innerWidth<640, step=span>40*864e5?(narrow?21:14):span>15*864e5?(narrow?10:7):(narrow?4:2); const d=new Date(a); d.setHours(0,0,0,0);
   for(let x=d.getTime();x<=b;x+=step*864e5) if(x>=a) t.push([x,new Date(x).toLocaleDateString("fr-FR",{day:"numeric",month:"short"})]); return t; }
 function playerChips(key,withAll=true){
-  return el("div",{class:"chips"},[...(withAll?[["all","Tout le monde"]]:[]),...D.players.map(p=>[p.puuid,p.name])].map(([v,n])=>
+  return el("div",{class:"chips"},[...(withAll?[["all","Tout le monde"]]:[]),...PL.map(p=>[p.puuid,p.name])].map(([v,n])=>
     el("button",{"aria-pressed":S[key]===v?"true":"false",onclick:()=>{S[key]=v; render();},style:v!=="all"?`border-left:4px solid ${colorOf(v)}`:""},n)));
 }
 
@@ -1285,7 +2401,7 @@ const TNAME=["Fer","Bronze","Argent","Or","Platine","Émeraude","Diamant"], DNAM
 const lpLabel=v=>v>=2800?`Maître ${Math.round(v-2800)} LP`:`${TNAME[Math.floor(v/400)]||"?"} ${DNAME[Math.floor(v%400/100)]}`;
 function lpBlock(){
   const [a,b]=periodBounds(), qi=S.q==="solo"?1:2;
-  const series=D.players.filter(p=>S.cp==="all"||p.puuid===S.cp).map(p=>{ const h=(p.lp||[]).filter(x=>x[qi]!=null);
+  const series=PL.filter(p=>S.cp==="all"||p.puuid===S.cp).map(p=>{ const h=(p.lp||[]).filter(x=>x[qi]!=null);
     const before=h.filter(x=>x[0]<a).pop(); const pts=h.filter(x=>x[0]>=a&&x[0]<=b).map(x=>[x[0],x[qi]]);
     if(before) pts.unshift([a,before[qi]]); return {name:p.name,color:colorOf(p.puuid),pts}; }).filter(s=>s.pts.length);
   const box=el("section",{class:"block"},el("h3",{},"Évolution du rang"),el("p",{class:"lead"},"Le rang de chacun, relevé à chaque lancement du programme. Les pointillés marquent les changements de palier."));
@@ -1298,7 +2414,7 @@ function lpBlock(){
 function formBlock(){
   const box=el("section",{class:"block"},el("h3",{},"Forme du moment"),el("p",{class:"lead"},"Pourcentage de victoires sur les 10 dernières parties, partie après partie. Au-dessus de 50 %, c'est la bonne période ; en dessous, gare au tilt."));
   const [a,b]=periodBounds();
-  const series=D.players.filter(p=>S.cp==="all"||p.puuid===S.cp).map(p=>{ const l=D.games.filter(g=>g.q===S.q&&g.date<=b).map(g=>({g,me:g.parts.find(x=>x.puuid===p.puuid)})).filter(x=>x.me).sort((x,y)=>x.g.date-y.g.date);
+  const series=PL.filter(p=>S.cp==="all"||p.puuid===S.cp).map(p=>{ const l=D.games.filter(g=>g.q===S.q&&g.date<=b).map(g=>({g,me:g.parts.find(x=>x.puuid===p.puuid)})).filter(x=>x.me).sort((x,y)=>x.g.date-y.g.date);
     const pts=[]; l.forEach((x,i)=>{ if(x.g.date<a) return; const w=l.slice(Math.max(0,i-9),i+1); if(w.length<5) return; pts.push([x.g.date,w.filter(y=>y.me.win).length/w.length*100]); });
     return {name:p.name,color:colorOf(p.puuid),pts}; }).filter(s=>s.pts.length>1);
   if(!series.length){ box.append(el("p",{class:"empty-state"},"Pas assez de parties sur cette période (il en faut au moins 5 par joueur).")); return box; }
@@ -1308,7 +2424,7 @@ function formBlock(){
 function heatBlock(){
   const days=["Lun","Mar","Mer","Jeu","Ven","Sam","Dim"], slots=["0h","3h","6h","9h","12h","15h","18h","21h"];
   const C=[...Array(7)].map(()=>[...Array(8)].map(()=>({n:0,w:0})));
-  for(const g of gamesFor(S.month,S.q)){ const fs=g.parts.filter(p=>p.friend&&(S.cp==="all"||p.puuid===S.cp)); if(!fs.length) continue;
+  for(const g of gamesFor(S.month,S.q)){ const fs=g.parts.filter(p=>isF(p)&&(S.cp==="all"||p.puuid===S.cp)); if(!fs.length) continue;
     const d=new Date(g.date), c=C[(d.getDay()+6)%7][Math.floor(d.getHours()/3)]; for(const p of fs){ c.n++; c.w+=p.win?1:0; } }
   const max=Math.max(1,...C.flat().map(c=>c.n));
   const cells=C.flat().map((c,i)=>({c,d:Math.floor(i/8),s:i%8})).filter(x=>x.c.n>=3);
@@ -1326,12 +2442,12 @@ function heatBlock(){
 }
 function deathBlock(){
   // joueurs affichés sur la carte (plusieurs possibles) et moment de la partie
-  if(!Array.isArray(S.mp)) S.mp=D.players.map(p=>p.puuid);
+  if(!Array.isArray(S.mp)) S.mp=PL.map(p=>p.puuid);
   const PH=[["all","Toute la partie",0,999],["early","Début (0-14 min)",0,14],["mid","Milieu (14-25 min)",14,25],["late","Fin (25 min et +)",25,999]];
   const ph=PH.find(x=>x[0]===(S.mph||"all"));
   let n=0; const pts=[]; const count={};
   for(const g of gamesFor(S.month,S.q)){ if(!g.review) continue;
-    const fr=g.parts.filter(p=>p.friend&&S.mp.includes(p.puuid)); if(!fr.length) continue; n++;
+    const fr=g.parts.filter(p=>isF(p)&&S.mp.includes(p.puuid)); if(!fr.length) continue; n++;
     const who=Object.fromEntries(fr.map(p=>[p.pid,p.puuid]));
     for(const e of g.review.events){ if(e.k!=="kill"||e.x==null||e.t<ph[2]||e.t>=ph[3]) continue;
       const pu=S.dm==="d"?who[e.victim]:who[e.killer]; if(!pu) continue; pts.push([e.x,e.y,pu]); count[pu]=(count[pu]||0)+1; } }
@@ -1341,8 +2457,8 @@ function deathBlock(){
     el("div",{class:"chips"},[["d","Morts"],["k","Kills"]].map(([v,t])=>el("button",{"aria-pressed":S.dm===v?"true":"false",onclick:()=>{S.dm=v; render();}},t)),
       el("span",{style:"width:10px"}),PH.map(([v,t])=>el("button",{"aria-pressed":(S.mph||"all")===v?"true":"false",onclick:()=>{S.mph=v; render();}},t))),
     el("div",{class:"chips"},
-      el("button",{"aria-pressed":S.mp.length===D.players.length?"true":"false",onclick:()=>{S.mp=S.mp.length===D.players.length?[]:D.players.map(p=>p.puuid); render();}},S.mp.length===D.players.length?"Tout décocher":"Tout le monde"),
-      D.players.map(p=>{ const on=S.mp.includes(p.puuid), c=colorOf(p.puuid);
+      el("button",{"aria-pressed":S.mp.length===PL.length?"true":"false",onclick:()=>{S.mp=S.mp.length===PL.length?[]:PL.map(p=>p.puuid); render();}},S.mp.length===PL.length?"Tout décocher":"Tout le monde"),
+      PL.map(p=>{ const on=S.mp.includes(p.puuid), c=colorOf(p.puuid);
         return el("button",{"aria-pressed":on?"true":"false",onclick:()=>toggle(p.puuid),style:on?`border-color:${c};color:var(--ivory);background:${c}26`:""},
           el("span",{style:`display:inline-block;width:10px;height:10px;border-radius:50%;margin-right:6px;background:${on?c:"transparent"};border:2px solid ${c}`}),
           p.name,on&&count[p.puuid]?el("span",{class:"mut"},` ${count[p.puuid]}`):null); })));
@@ -1372,7 +2488,7 @@ function radarBlock(pu){
   const box=el("div");
   const draw=()=>{ const list=[{name:P[pu].name,color:colorOf(pu),v:rv(pu)}]; if(S.rc&&S.rc!==pu) list.push({name:P[S.rc].name,color:colorOf(S.rc),v:rv(S.rc)});
     const sel=el("select",{style:"background:var(--night);border:1px solid var(--line);border-radius:8px;padding:5px 8px",onchange:e=>{S.rc=e.target.value; draw();}},
-      el("option",{value:""},"Personne"),D.players.filter(p=>p.puuid!==pu).map(p=>el("option",{value:p.puuid},p.name))); sel.value=S.rc&&S.rc!==pu?S.rc:"";
+      el("option",{value:""},"Personne"),PL.filter(p=>p.puuid!==pu).map(p=>el("option",{value:p.puuid},p.name))); sel.value=S.rc&&S.rc!==pu?S.rc:"";
     box.replaceChildren(el("div",{class:"sortbar"},"Comparer avec",sel),radar(list),
       el("p",{class:"foot"},"Chaque branche compare le joueur au meilleur du groupe sur la période : le bord extérieur, c'est le meilleur.")); };
   draw(); return box;
@@ -1380,9 +2496,9 @@ function radarBlock(pu){
 
 /* ---------- onglet Duel ---------- */
 function duel(m){
-  const A=aggregate(S.month,S.q); if(S.da===S.db) S.db=D.players.find(p=>p.puuid!==S.da)?.puuid;
+  const A=aggregate(S.month,S.q); if(S.da===S.db) S.db=PL.find(p=>p.puuid!==S.da)?.puuid;
   const a=A[S.da], b=A[S.db];
-  const pick=key=>{ const s=el("select",{"aria-label":"Joueur",onchange:e=>{S[key]=e.target.value; render();}},D.players.map(p=>el("option",{value:p.puuid},p.name))); s.value=S[key]; return s; };
+  const pick=key=>{ const s=el("select",{"aria-label":"Joueur",onchange:e=>{S[key]=e.target.value; render();}},PL.map(p=>el("option",{value:p.puuid},p.name))); s.value=S[key]; return s; };
   m.append(el("h2",{},`Duel de potes, ${QN[S.q].toLowerCase()}`),el("p",{class:"lead"},`${monthName(S.month)}. Choisis deux potes : celui qui gagne la catégorie est en doré.`),
     el("div",{class:"duelhead"},el("div",{class:"side"},avatar(S.da),pick("da")),el("div",{class:"vs"},"VS"),el("div",{class:"side"},avatar(S.db),pick("db"))));
   if(!a?.games||!b?.games){ m.append(el("p",{class:"empty-state"},`${!a?.games?P[S.da].name:P[S.db].name} n'a pas de partie ${QN[S.q].toLowerCase()} sur cette période.`)); return; }
@@ -1409,7 +2525,7 @@ function duel(m){
 /* ---------- en game maintenant ---------- */
 function liveBanner(){
   const now=Date.now();
-  const live=D.players.filter(p=>p.live&&p.live.start&&now-p.live.start<75*60000);
+  const live=PL.filter(p=>p.live&&p.live.start&&now-p.live.start<75*60000);
   if(!live.length) return null;
   return el("div",{class:"live"},el("div",{class:"wrap"},el("span",{class:"dot","aria-hidden":"true"}),el("b",{},"En game"),
     live.map(p=>el("span",{class:"lp"},avatar(p.puuid),p.live.champ?champImg(p.live.champ):null,
@@ -1444,7 +2560,7 @@ function matchupBlock(){
 
 /* ---------- wrapped du mois ---------- */
 function wrapped(m){
-  if(!S.wp||!P[S.wp]) S.wp=D.players[0]?.puuid;
+  if(!S.wp||!P[S.wp]) S.wp=PL[0]?.puuid;
   const A=aggregate(S.month,null), a=A[S.wp], p=P[S.wp];
   m.append(el("h2",{},`Wrapped, ${monthName(S.month).toLowerCase()}`),
     el("p",{class:"lead"},"Le résumé du mois de chaque pote, toutes ranked confondues. Fais une capture pour la partager, ou copie le texte pour Discord."),playerChips("wp",false));
@@ -1475,7 +2591,7 @@ function wrapped(m){
     ["Ton créneau",`${days[fav[0]]} ${fav[1]}h`,"le moment où tu joues le plus"],
     ["Kills",fmt(a.k),`${fmt(a.d)} morts, ${fmt(a.dead/60)} min passées à attendre`],
     lpStart&&lpEnd&&lpStart!==lpEnd?["Ton rang",lpLabel(lpEnd[1]),`${lpEnd[1]-lpStart[1]>=0?"+":""}${lpEnd[1]-lpStart[1]} points depuis ${lpLabel(lpStart[1])}`]:null,
-    place?["Dans la ligue",`${place}e`,`sur ${R.length} joueurs classés`]:null,
+    place?["Dans la ligue",ord(place),`sur ${R.length} joueurs classés`]:null,
   ].filter(Boolean);
   const card=el("article",{class:"wrapped"},el("div",{class:"wbg",style:`background-image:url('${splash(top[0])}')`}),
     el("div",{class:"winner"},el("div",{class:"wtop"},el("img",{src:iconSrc(p.icon),alt:""}),el("div",{},el("div",{class:"wm"},monthName(S.month)),el("div",{class:"wn"},p.name))),
@@ -1491,9 +2607,9 @@ function wrapped(m){
 function games(m){
   const list=gamesFor(S.month,S.q).filter(g=>S.gp==="all"||g.parts.some(p=>p.puuid===S.gp));
   m.append(el("h2",{},`Parties ${QN[S.q].toLowerCase()}`),el("p",{class:"lead"},`${monthName(S.month)}, ${list.length} partie${list.length>1?"s":""}. Touche une partie pour la revue détaillée.`),
-    el("div",{class:"chips"},[["all","Tout le monde"],...D.players.map(p=>[p.puuid,p.name])].map(([v,n])=>el("button",{"aria-pressed":S.gp===v?"true":"false",onclick:()=>{S.gp=v; render();}},n))));
+    el("div",{class:"chips"},[["all","Tout le monde"],...PL.map(p=>[p.puuid,p.name])].map(([v,n])=>el("button",{"aria-pressed":S.gp===v?"true":"false",onclick:()=>{S.gp=v; render();}},n))));
   if(!list.length){ m.append(el("p",{class:"empty-state"},"Aucune partie sur cette période.")); return; }
-  m.append(el("div",{class:"table"},list.map(g=>{ const fs=g.parts.filter(p=>p.friend); const win=fs[0]?.win;
+  m.append(el("div",{class:"table"},list.map(g=>{ const fs=g.parts.filter(p=>isF(p)); const win=fs[0]?.win;
     return el("button",{class:"game",onclick:()=>openReview(g)},el("div",{class:"bar",style:`background:${win?"var(--teal)":"var(--red)"}`}),
       el("div",{},el("div",{class:"meta"},el("span",{},new Date(g.date).toLocaleString("fr-FR",{weekday:"short",day:"numeric",month:"short",hour:"2-digit",minute:"2-digit"})),
           el("span",{},`${Math.floor(g.dur/60)} min`),g.review?el("span",{class:"gold"},"revue disponible"):null),
@@ -1504,7 +2620,7 @@ function games(m){
 /* ---------- duos ---------- */
 function duos(m){
   const D2={};
-  for(const g of gamesFor(S.month,S.q)){ const fs=g.parts.filter(p=>p.friend);
+  for(const g of gamesFor(S.month,S.q)){ const fs=g.parts.filter(p=>isF(p));
     for(let i=0;i<fs.length;i++) for(let j=i+1;j<fs.length;j++){ if(fs[i].team!==fs[j].team) continue;
       const k=[fs[i].puuid,fs[j].puuid].sort().join("|"); (D2[k]??={a:k.split("|")[0],b:k.split("|")[1],n:0,w:0}); D2[k].n++; D2[k].w+=fs[i].win?1:0; } }
   const rows=Object.values(D2).sort((a,b)=>b.w/b.n-a.w/a.n||b.n-a.n);
@@ -1550,8 +2666,13 @@ function openProfile(pu){
   sheet(el("div",{style:"display:flex;gap:14px;align-items:center"},el("img",{src:iconSrc(p.icon),alt:"",style:"width:72px;height:72px;border-radius:50%;border:3px solid var(--gold)"}),
       el("div",{},el("div",{class:"sh-title"},p.name),el("div",{class:"sh-sub"},`${p.name}#${p.tag}`),
         el("div",{style:"display:flex;gap:14px;flex-wrap:wrap;margin-top:4px"},el("span",{},el("span",{class:"mut"},"Solo/duo "),tierTxt(p.ranks?.solo)),el("span",{},el("span",{class:"mut"},"Flex "),tierTxt(p.ranks?.flex))))),
-    [el("h4",{},`${QN[S.q]}, ${monthName(S.month).toLowerCase()}`),
+    [el("div",{class:"links",style:"margin-top:4px"},(p.structs||[]).map(id=>SBY[id]?el("button",{class:"btn",onclick:()=>{document.querySelector(".ov")?.remove(); document.body.style.overflow=""; setScope(id); render(); scrollTo(0,0);}},logo(SBY[id],20)," ",SBY[id].nom):null),
+       el("button",{class:"btn",onclick:e=>{ const u=location.href.split("#")[0]+"#j-"+slug(p); navigator.clipboard?.writeText(u).then(()=>e.target.textContent="Lien copié ✓",()=>e.target.textContent=u); }},"Copier le lien de sa fiche")),
+     el("h4",{},`${QN[S.q]}, ${monthName(S.month).toLowerCase()}`),
      A.games?el("div",{class:"tiles"},tiles.map(([v,l])=>el("div",{class:"tile"},el("b",{},v),el("span",{},l)))):el("p",{class:"mut"},"Aucune partie sur cette période."),
+     (()=>{ const pal=palmares(pu); if(!pal.length) return null; const cnt={}; for(const t of pal) (cnt[t.n]??={...t,c:0,months:[]}).c++, cnt[t.n].months.push(monthName(t.mo).split(" ")[0]+" ("+QN[t.q].toLowerCase()+")");
+       return [el("h4",{},`Palmarès : ${pal.length} trophée${pal.length>1?"s":""}`),el("div",{class:"palm"},Object.values(cnt).sort((a,b)=>b.c-a.c).map(t=>el("span",{class:"c-"+t.type,title:t.months.join(", ")},`${t.e} ${t.n}`,t.c>1?el("b",{},` ×${t.c}`):null)))]; })(),
+     A.games?[el("h4",{},"Bilan du coach"),coachSummary(pu,S.month,null)]:null,
      A.games?[el("h4",{},"Style de jeu"),radarBlock(pu)]:null,
      trend.length>1?[el("h4",{},"Note moyenne par mois"),el("div",{class:"bars"},trend.map(({mo,a})=>el("div",{},el("b",{},fmt(a.note,1)),el("i",{style:`height:${Math.max(4,a.note/maxN*70)}px`}),el("span",{},(()=>{const [y,mm]=mo.split("-").map(Number); return new Date(y,mm-1,1).toLocaleString("fr-FR",{month:"short"});})())) ))]:null,
      champs.length?[el("h4",{},"Champions"),el("div",{class:"tw"},el("table",{},el("tr",{},el("th",{},"Champion"),el("th",{},"Parties"),el("th",{},"Victoires %"),el("th",{},"KDA")),
@@ -1567,21 +2688,15 @@ function openProfile(pu){
 
 /* ---------- revue d'une partie ---------- */
 function openReview(g){
-  const fs=g.parts.filter(p=>p.friend), my=fs[0]?.team||100, win=fs[0]?.win, R=g.review;
-  const name=pid=>{ const p=g.parts.find(x=>x.pid===pid); return p?(p.friend?p.name:p.champ):"?"; };
+  const fs=g.parts.filter(p=>isF(p)), my=fs[0]?.team||100, win=fs[0]?.win, R=g.review;
+  const name=pid=>{ const p=g.parts.find(x=>x.pid===pid); return p?(isF(p)?p.name:p.champ):"?"; };
   const body=[];
   if(R){
     const sign=my===100?1:-1, gold=R.gold.map(v=>v*sign);
     body.push(el("h4",{},"Écart d'or"),goldChart(gold,R),
       R.turn?el("p",{class:"callout"},`Le tournant : entre ${R.turn.from} et ${R.turn.to} min, l'écart a bougé de `,el("b",{class:R.turn.swing*sign>0?"win":"loss"},`${R.turn.swing*sign>0?"+":""}${fmt(R.turn.swing*sign)} d'or`),`. ${turnEvents(R,my)}`):null);
-    body.push(el("h4",{},"Les potes dans cette partie"),el("div",{class:"fgrid"},R.friends.map(f=>{ const p=g.parts.find(x=>x.pid===f.pid);
-      return el("div",{class:"fcard"},el("div",{class:"h"},champImg(p.champ),el("div",{},el("b",{},p.name),el("div",{class:"mut",style:"font-size:13px"},`${POS[f.pos]||""}, ${p.k}/${p.d}/${p.a}, note ${fmt(p.score,1)}`))),
-        el("div",{class:"mini"},el("div",{},el("b",{},f.cs10??"–"),"CS à 10 min",f.csOpp10!=null?el("div",{},`adversaire ${f.csOpp10}`):null),
-          el("div",{},el("b",{class:f.gd10>=0?"win":"loss"},f.gd10!=null?(f.gd10>0?"+":"")+fmt(f.gd10):"–"),"or à 10 min",f.opp?el("div",{},"contre "+f.opp):null),
-          el("div",{},el("b",{class:f.gd15>=0?"win":"loss"},f.gd15!=null?(f.gd15>0?"+":"")+fmt(f.gd15):"–"),"or à 15 min")),
-        el("div",{class:"mut",style:"font-size:13px"},f.deaths.length?`Morts à ${f.deaths.map(d=>fmt(d,0)+" min").join(", ")}`:"Aucune mort"),
-        f.tips.length?el("ul",{class:"tips"},f.tips.map(t=>el("li",{},t))):null); })));
-    const evs=R.events.filter(e=>e.k!=="kill"||[e.killer,e.victim,...(e.assists||[])].some(pid=>g.parts.find(p=>p.pid===pid)?.friend));
+    body.push(el("h4",{},"Le coach"),el("div",{class:"fgrid"},R.friends.filter(f=>SC.has(f.puuid)).map(f=>coachCard(g,f))));
+    const evs=R.events.filter(e=>e.k!=="kill"||[e.killer,e.victim,...(e.assists||[])].some(pid=>isF(g.parts.find(p=>p.pid===pid))));
     body.push(el("h4",{},"Moments clés"),el("div",{class:"evs"},evs.map(e=>{ const ours=e.team===my;
       const txt=e.k==="kill"?`${name(e.killer)} tue ${name(e.victim)}${e.assists?.length?` avec ${e.assists.map(name).join(", ")}`:""}`:`${e.name}, ${ours?"pour vous":"pour eux"}`;
       return el("div",{class:"ev"},el("span",{class:"t"},`${Math.floor(e.t)}:${String(Math.round((e.t%1)*60)).padStart(2,"0")}`),el("span",{style:`color:${ours?"var(--teal)":"var(--red)"}`},(e.k==="kill"?"⚔️ ":e.k==="obj"?"🐉 ":"🏰 ")+txt)); })));
@@ -1616,10 +2731,16 @@ function goldChart(gold,R){
 function scoreboard(g,my){
   return el("div",{class:"tw"},[my,300-my].map(t=>{ const ps=g.parts.filter(p=>p.team===t), w=ps[0]?.win;
     return el("table",{style:"margin-bottom:14px"},el("tr",{},el("th",{},el("span",{class:w?"win":"loss"},`${t===my?"Ton équipe":"Adversaires"}, ${w?"victoire":"défaite"}`)),el("th",{},"KDA"),el("th",{},"CS"),el("th",{},"Dégâts"),el("th",{},"Vision"),el("th",{},"Note"),el("th",{style:"text-align:left"},"Objets")),
-      ps.map(p=>el("tr",{class:p.friend?"me":""},el("td",{},el("span",{class:"ci"},champImg(p.champ),el("span",{},el("b",{},p.name),el("span",{class:"mut"}," "+(POS[p.pos]||""))))),
+      ps.map(p=>el("tr",{class:isF(p)?"me":""},el("td",{},el("span",{class:"ci"},champImg(p.champ),el("span",{},el("b",{},p.name),el("span",{class:"mut"}," "+(POS[p.pos]||""))))),
         el("td",{},`${p.k}/${p.d}/${p.a}`),el("td",{},p.cs),el("td",{},fmt(p.dmg)),el("td",{},p.vis),el("td",{},fmt(p.score,1)),el("td",{style:"text-align:left"},el("div",{class:"items"},p.items.map(itemImg)))))); }));
 }
+if(MULTI) $("pname").textContent=D.ligue||"La ligue des structures";
+const H0=location.hash;
+setScope((H0.match(/^#s-(.+)$/)||[])[1]||"league");
+addEventListener("hashchange",()=>{ if(location.hash.startsWith("#j-")){ openFromHash(); return; } if(location.hash==="#admin"){ render(); return; }
+  const id=(location.hash.match(/^#s-(.+)$/)||[])[1]||"league"; if(id!==S.scope){ setScope(id); render(); } });
 render();
+if(H0.startsWith("#j-")){ history.replaceState(null,"",H0); openFromHash(); }
 /* ---------- appli téléphone ---------- */
 if(location.protocol==="https:"&&"serviceWorker" in navigator) navigator.serviceWorker.register("sw.js").catch(()=>{});
 let installEvt=null;
@@ -1646,7 +2767,11 @@ def main():
         if demo:
             say("Mode démo : données inventées.")
             cfg = dict(DEFAULT_CONFIG)
-            players, matches, timelines = demo_data(cfg)
+            if "--structures" in sys.argv:
+                cfg = demo_structures_config()
+                players, matches, timelines = demo_data(cfg, [r.split("#")[0] for r in roster_ids(cfg)])
+            else:
+                players, matches, timelines = demo_data(cfg)
         else:
             cfg = load_config()
             if not cfg:
@@ -1654,15 +2779,40 @@ def main():
             say("Récupération des parties sur l'API Riot…")
             players, matches, timelines = fetch_all(cfg)
         ddv = ddragon_version()
+        LEGENDARY.update(legendary_items(ddv) if ddv else set())
+        if demo and not LEGENDARY:
+            LEGENDARY.update({3078, 6692, 3071, 3031})
         if any(p.get("live") for p in players) and ddv:
             names = champion_names(ddv)
             for p in players:
                 if p.get("live") and not p["live"].get("champ"):
                     p["live"]["champ"] = names.get(p["live"].get("champId"))
         data = build_report(players, matches, timelines, ddv, cfg["mois"], cfg["min_parties_classement"], demo)
+        data.update(structures_payload(cfg, players))
+        for p in data["players"]:
+            p["structs"] = next((x.get("structs", []) for x in players if x["puuid"] == p["puuid"]), [])
         webhook = os.environ.get("DISCORD_WEBHOOK") or cfg.get("discord_webhook", "")
-        if webhook and not demo:
-            discord_alerts(cfg, players, data, webhook)
+        if not demo:
+            if data.get("mode") == "structures":
+                # salon de la ligue : exploits, joueur du mois, structure du mois
+                if webhook:
+                    BOT_NAME[0] = data.get("ligue", "La ligue")
+                    discord_alerts(cfg, players, data, webhook, only={"exploits", "joueur_du_mois"}, league=True, title="ligue")
+                # salon de chaque structure : toutes les alertes de ses membres (secret DISCORD_WEBHOOKS en JSON {"id": "url"})
+                try:
+                    hooks = json.loads(os.environ.get("DISCORD_WEBHOOKS") or "{}")
+                except ValueError:
+                    hooks = {}
+                    say("⚠ Le secret DISCORD_WEBHOOKS n'est pas un JSON valide.")
+                if webhook or hooks:
+                    league_event_alerts(cfg, data, webhook, hooks)
+                for stc in data["structures"]:
+                    if hooks.get(stc["id"]):
+                        BOT_NAME[0] = stc["nom"]
+                        discord_alerts(cfg, players, data, hooks[stc["id"]], scope=set(stc["membres"]),
+                                       state_name=f"etat_alertes_{stc['id']}.json", title=stc["nom"])
+            elif webhook:
+                discord_alerts(cfg, players, data, webhook)
         if site:
             write_pwa(cfg)
         # mode site : si rien n'a changé (pas de nouvelle partie, pas de LP différents), on ne republie pas la page
