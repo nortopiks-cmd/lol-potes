@@ -167,6 +167,12 @@ class Riot:
         except RiotError:
             return None
 
+    def mastery(self, puuid, champ):
+        try:
+            return self.get(self.platform, f"/lol/champion-mastery/v4/champion-masteries/by-puuid/{puuid}/by-champion/{champ}")
+        except RiotError:
+            return None
+
     def match(self, mid):
         return self.get(self.region, f"/lol/match/v5/matches/{mid}", cache_name="m_" + mid)
 
@@ -504,6 +510,34 @@ def build_report(players, matches, timelines, ddv, months, min_games, demo=False
 
 
 # --------------------------------------------------------------------------- récupération réelle
+LIVE_GAMES = {}
+
+
+def live_game(api, g, known):
+    """Partie en cours : la draft complète, avec le rang et la maîtrise de chaque joueur."""
+    say("   en game : lecture de la draft")
+    out = []
+    for x in g.get("participants", []):
+        pu = x.get("puuid")
+        rank = None
+        if pu and pu not in known:
+            try:
+                for e in api.leagues(pu):
+                    if e.get("queueType") == ("RANKED_FLEX_SR" if g.get("gameQueueConfigId") == 440 else "RANKED_SOLO_5x5"):
+                        rank = {"tier": e["tier"], "div": e.get("rank", ""), "lp": e.get("leaguePoints", 0), "w": e.get("wins", 0), "l": e.get("losses", 0)}
+            except RiotError:
+                pass
+        m = api.mastery(pu, x.get("championId")) if pu else None
+        perks = x.get("perks") or {}
+        out.append({"team": x.get("teamId"), "champId": x.get("championId"), "riot": x.get("riotId") or x.get("summonerName") or "Joueur",
+                    "puuid": pu, "friend": pu in known, "spells": [x.get("spell1Id"), x.get("spell2Id")],
+                    "key": (perks.get("perkIds") or [None])[0], "sub": perks.get("perkSubStyle"), "rank": rank,
+                    "mast": {"lvl": m.get("championLevel"), "pts": m.get("championPoints"), "last": m.get("lastPlayTime")} if m else None})
+    return {"id": g.get("gameId"), "queue": g.get("gameQueueConfigId"), "mode": QUEUE_LABELS.get(g.get("gameQueueConfigId"), g.get("gameMode", "Partie")),
+            "start": g.get("gameStartTime"), "parts": out,
+            "bans": [{"team": b.get("teamId"), "champId": b.get("championId"), "turn": b.get("pickTurn")} for b in g.get("bannedChampions", [])]}
+
+
 def fetch_all(cfg):
     key = os.environ.get("RIOT_API_KEY") or cfg.get("cle_api", "")
     if not key or "colle" in key:
@@ -528,6 +562,8 @@ def fetch_all(cfg):
     json.dump(accs, open(acc_cache, "w", encoding="utf-8"))
     if not players:
         raise RiotError("Aucun joueur valide dans config.json.")
+    LIVE_GAMES.clear()
+    known = {p["puuid"] for p in players}
     for p in players:
         say(f"• {p['name']}#{p['tag']}")
         ranks = {}
@@ -541,7 +577,9 @@ def fetch_all(cfg):
         if g:
             me = next((x for x in g.get("participants", []) if x.get("puuid") == p["puuid"]), {})
             p["live"] = {"champId": me.get("championId"), "queue": g.get("gameQueueConfigId"), "start": g.get("gameStartTime"),
-                         "mode": QUEUE_LABELS.get(g.get("gameQueueConfigId"), g.get("gameMode", "Partie"))}
+                         "mode": QUEUE_LABELS.get(g.get("gameQueueConfigId"), g.get("gameMode", "Partie")), "game": g.get("gameId")}
+            if g.get("gameId") not in LIVE_GAMES:
+                LIVE_GAMES[g.get("gameId")] = live_game(api, g, known)
         ids = set()
         for qid in QUEUES:
             ids.update(api.match_ids(p["puuid"], qid, start, cfg["max_parties_par_joueur"]))
@@ -659,7 +697,25 @@ def demo_data(cfg, names=None):
                                                             "level": min(18, 1 + minute // 2), "position": {"x": int(rnd.gauss(LANES[parts[pid - 1]["teamPosition"]][0], 2200)),
                                                                                                          "y": int(rnd.gauss(LANES[parts[pid - 1]["teamPosition"]][1], 2200))}} for pid in tot}})
         timelines[mid] = {"info": {"frames": frames}}
-    players[1]["live"] = {"champ": "Darius", "queue": 420, "start": int(time.time() * 1000) - 9 * 60000, "mode": "Ranked solo/duo"}
+    st = int(time.time() * 1000) - 9 * 60000
+    players[1]["live"] = {"champ": "Darius", "queue": 420, "start": st, "mode": "Ranked solo/duo", "game": 1}
+    players[3]["live"] = {"champ": "Thresh", "queue": 420, "start": st, "mode": "Ranked solo/duo", "game": 1}
+    TIERS = ["SILVER", "GOLD", "GOLD", "PLATINUM", "EMERALD"]
+    ally = [("Darius", players[1]), ("Viego", None), ("Ahri", None), ("Jinx", None), ("Thresh", players[3])]
+    foe = ["Garen", "Lee Sin", "Syndra", "Kai'Sa", "Nautilus"]
+    sp = {"Darius": [4, 14], "Viego": [4, 11], "Ahri": [4, 14], "Jinx": [4, 7], "Thresh": [4, 14], "Garen": [4, 12], "Lee Sin": [11, 4],
+          "Syndra": [4, 12], "Kai'Sa": [4, 7], "Nautilus": [4, 14]}
+    ks = {"Darius": 8010, "Viego": 8010, "Ahri": 8112, "Jinx": 8008, "Thresh": 8439, "Garen": 8010, "Lee Sin": 8010, "Syndra": 8229, "Kai'Sa": 9923, "Nautilus": 8439}
+    pk, RN = [], rnd.sample(["Zeyrox", "Nami Lover", "KCorp fan", "Wolfy", "Tenebris", "Mister V", "Lynx", "Orka", "Baguette", "Sakura"], 10)
+    for i, (c, f) in enumerate(ally + [(c, None) for c in foe]):
+        t = TIERS[rnd.randrange(5)]
+        pk.append({"team": 100 if i < 5 else 200, "champ": c, "riot": f"{f['name']}#{f['tag']}" if f else RN[i] + "#EUW",
+                   "puuid": f["puuid"] if f else None, "friend": bool(f), "spells": sp[c], "key": ks[c], "sub": rnd.choice([8100, 8200, 8300, 8400]),
+                   "rank": None if f else {"tier": t, "div": rnd.choice(["I", "II", "III", "IV"]), "lp": rnd.randint(0, 99), "w": rnd.randint(20, 120), "l": rnd.randint(20, 120)},
+                   "mast": {"lvl": rnd.randint(3, 40), "pts": rnd.choice([4000, 25000, 80000, 240000, 610000]), "last": now - rnd.randint(1, 60) * 86400000}})
+    LIVE_GAMES.clear()
+    LIVE_GAMES[1] = {"id": 1, "queue": 420, "mode": "Ranked solo/duo", "start": st, "parts": pk,
+                     "bans": [{"team": 100 if i < 5 else 200, "champ": c, "turn": i + 1} for i, c in enumerate(["Yasuo", "Zed", "Master Yi", "Teemo", "Shaco", "Yone", "Blitzcrank", "Morgana", "Vayne", "Katarina"])]}
     # historique de LP inventé (un point par jour)
     day = 86400000
     for i, p in enumerate(players):
@@ -1511,6 +1567,29 @@ tr.me td{background:rgba(212,173,98,.07)}
 .zbars div{display:grid;grid-template-columns:120px 1fr 48px;gap:8px;align-items:center;font-size:13.5px;padding:3px 0}
 .zbars i{height:8px;border-radius:4px;background:var(--red);opacity:.8;display:block}
 .zbars b{text-align:right;font-family:var(--cond)}
+.ldot{display:inline-block;width:8px;height:8px;border-radius:50%;background:var(--red);margin-left:6px;vertical-align:middle}
+.lcard{background:var(--ink);border:1px solid var(--line);border-radius:14px;padding:14px;margin:14px 0}
+.lhead{display:flex;justify-content:space-between;gap:12px;flex-wrap:wrap;align-items:flex-end}
+.lhead h3{margin:0;font-family:var(--cond);font-size:26px}
+.lavg b{font-family:var(--cond);font-size:20px;margin-left:6px}.lavg .teal{color:var(--teal)}.lavg .red{color:var(--red)}
+.lduo{background:rgba(212,173,98,.1);border:1px solid rgba(212,173,98,.35);border-radius:10px;padding:8px 12px;font-size:14px;margin:12px 0 0}
+.lgrid{display:grid;grid-template-columns:1fr 1fr;gap:14px;margin-top:12px}
+@media (max-width:760px){.lgrid{grid-template-columns:1fr}}
+.lteam{border-top:3px solid var(--teal);padding-top:8px}.lteam.foe{border-color:var(--red)}
+.lth{display:flex;justify-content:space-between;align-items:center;gap:8px;margin-bottom:6px;font-family:var(--cond);font-size:18px}
+.lbans{display:flex;gap:3px}.ban img,.ban.none{width:24px;height:24px;border-radius:5px;filter:grayscale(1);opacity:.65;display:block;background:var(--night)}
+.lrow{display:grid;grid-template-columns:48px 26px 1fr;gap:8px;align-items:center;padding:7px 4px;border-bottom:1px solid var(--line);width:100%;text-align:left;background:none;border-left:0;border-right:0;border-top:0;color:inherit;font:inherit}
+.lrow.me{background:rgba(60,199,191,.08);border-radius:8px;cursor:pointer}
+.lch img,.noimg{width:48px;height:48px;border-radius:10px;display:block;background:var(--night)}
+.lsp{display:grid;gap:2px}.lsp img{width:24px;height:24px;border-radius:5px;display:block}
+.lru{position:relative;display:block;width:24px;height:24px}.lru img{width:24px;height:24px}.lru .sub{position:absolute;width:12px;height:12px;right:-4px;bottom:-2px;background:var(--night);border-radius:50%}
+.lwho{min-width:0;font-size:13.5px}.lwho b{font-size:15px;display:block;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.lrk{font-size:13px}.lm{font-size:12.5px}
+.ltags{display:flex;gap:4px;flex-wrap:wrap;margin-top:3px}
+.ltag{font-size:11.5px;padding:1px 7px;border-radius:999px;border:1px solid var(--line);color:var(--mut)}
+.ltag.gold{color:var(--gold);border-color:rgba(212,173,98,.5)}.ltag.red{color:var(--red);border-color:rgba(226,90,80,.5)}
+.lnotes{margin:4px 0 8px 4px;font-size:13px}
+
 .acard{background:var(--ink);border:1px solid var(--line);border-radius:14px;padding:14px 16px;margin-bottom:14px}
 .acard>summary{font-family:var(--cond);font-size:22px;font-weight:700;color:var(--ivory);cursor:pointer}
 .acard input,.acard select,.acard textarea{background:var(--night);border:1px solid var(--line);border-radius:8px;padding:8px 10px;color:var(--ivory);font:inherit;min-width:0}
@@ -1756,9 +1835,9 @@ function renderHero(){
 }
 
 /* ---------- navigation ---------- */
-const TABS=[["board","Classement"],["coach","Coach"],["postes","Postes"],["trophies","Trophées"],["wrapped","Wrapped"],["records","Records"],["charts","Graphiques"],["duel","Duel"],["games","Parties"],["duos","Duos"],["hall","Palmarès"]];
-const TABS_L=[["league","Structures"],["board","Joueurs"],["coach","Coach"],["postes","Postes"],["recrut","Recrutement"],["agenda","Agenda"],["matches","Matchs"],["trophies","Trophées"],["records","Records"],["charts","Graphiques"],["lhall","Palmarès"]];
-const TABS_S=[["sfiche","Fiche"],["teams","Équipes"],["board","Classement"],["coach","Coach"],["postes","Postes"],["agenda","Agenda"],["matches","Matchs"],["trophies","Trophées"],["wrapped","Wrapped"],["records","Records"],["charts","Graphiques"],["duel","Duel"],["games","Parties"],["duos","Duos"],["hall","Palmarès"]];
+const TABS=[["board","Classement"],["live","En game"],["coach","Coach"],["postes","Postes"],["trophies","Trophées"],["wrapped","Wrapped"],["records","Records"],["charts","Graphiques"],["duel","Duel"],["games","Parties"],["duos","Duos"],["hall","Palmarès"]];
+const TABS_L=[["league","Structures"],["board","Joueurs"],["live","En game"],["coach","Coach"],["postes","Postes"],["recrut","Recrutement"],["agenda","Agenda"],["matches","Matchs"],["trophies","Trophées"],["records","Records"],["charts","Graphiques"],["lhall","Palmarès"]];
+const TABS_S=[["sfiche","Fiche"],["teams","Équipes"],["board","Classement"],["live","En game"],["coach","Coach"],["postes","Postes"],["agenda","Agenda"],["matches","Matchs"],["trophies","Trophées"],["wrapped","Wrapped"],["records","Records"],["charts","Graphiques"],["duel","Duel"],["games","Parties"],["duos","Duos"],["hall","Palmarès"]];
 function render(){
   const y=scrollY;
   $("hero").style.display=location.hash==="#admin"?"none":"";
@@ -1769,10 +1848,10 @@ function render(){
   $("scopes").replaceChildren(...[scopeBar()].filter(Boolean));
   $("live").replaceChildren(...[liveBanner()].filter(Boolean));
   renderHero();
-  $("tabs").replaceChildren(...tabs.map(([k,n])=>el("button",{"aria-current":S.tab===k?"page":null,onclick:()=>{S.tab=k; render();}},n)));
+  $("tabs").replaceChildren(...tabs.map(([k,n])=>el("button",{"aria-current":S.tab===k?"page":null,onclick:()=>{S.tab=k; render();}},n,k==="live"&&liveGames().length?el("span",{class:"ldot","aria-label":"partie en cours"}):null)));
   const m=$("main"); m.replaceChildren();
   if(D.demo) m.append(el("div",{class:"demo"},MULTI?"Exemple avec des structures, des joueurs et des parties inventés.":"Exemple avec des joueurs et des parties inventés. Mets ta clé API dans config.json et relance le programme sans --demo pour voir vos vraies parties."));
-  ({board,trophies,wrapped,records,charts,duel,games,duos,hall,league,sfiche,teams,matches,lhall:leagueHall,postes,recrut,agenda,coach:coachTab})[S.tab](m);
+  ({board,trophies,wrapped,records,charts,duel,games,duos,hall,league,sfiche,teams,matches,lhall:leagueHall,postes,recrut,agenda,coach:coachTab,live:liveTab})[S.tab](m);
   scrollTo(0,y); // garde la position quand on touche un filtre
 }
 
@@ -2527,9 +2606,77 @@ function liveBanner(){
   const now=Date.now();
   const live=PL.filter(p=>p.live&&p.live.start&&now-p.live.start<75*60000);
   if(!live.length) return null;
-  return el("div",{class:"live"},el("div",{class:"wrap"},el("span",{class:"dot","aria-hidden":"true"}),el("b",{},"En game"),
+  return el("div",{class:"live",role:"button",tabindex:"0",style:"cursor:pointer",title:"Voir la draft",onclick:()=>{S.tab="live"; render(); $("tabs").scrollIntoView({behavior:"smooth"});}},el("div",{class:"wrap"},el("span",{class:"dot","aria-hidden":"true"}),el("b",{},"En game"),
     live.map(p=>el("span",{class:"lp"},avatar(p.puuid),p.live.champ?champImg(p.live.champ):null,
       el("span",{},el("b",{},p.name),` ${p.live.champ||""}, ${p.live.mode||"partie"}, depuis ${Math.max(1,Math.round((now-p.live.start)/60000))} min`)))));
+}
+
+/* ---------- onglet En game : la draft de la partie en cours ---------- */
+const SPELLS={1:"SummonerBoost",3:"SummonerExhaust",4:"SummonerFlash",6:"SummonerHaste",7:"SummonerHeal",11:"SummonerSmite",12:"SummonerTeleport",13:"SummonerMana",14:"SummonerDot",21:"SummonerBarrier",32:"SummonerSnowball"};
+const SPELL_FR={1:"Purge",3:"Fatigue",4:"Flash",6:"Fantôme",7:"Soins",11:"Châtiment",12:"Téléportation",14:"Embrasement",21:"Barrière",32:"Boule de neige"};
+const RUNES={8005:["Precision/PressTheAttack/PressTheAttack","Attaque soutenue"],8008:["Precision/LethalTempo/LethalTempoTemp","Tempo mortel"],8021:["Precision/FleetFootwork/FleetFootwork","Jeu de jambes"],
+  8010:["Precision/Conqueror/Conqueror","Conquérant"],8112:["Domination/Electrocute/Electrocute","Électrocution"],8128:["Domination/DarkHarvest/DarkHarvest","Moisson noire"],
+  9923:["Domination/HailOfBlades/HailOfBlades","Déluge de lames"],8214:["Sorcery/SummonAery/SummonAery","Invocation d'Aery"],8229:["Sorcery/ArcaneComet/ArcaneComet","Comète arcanique"],
+  8230:["Sorcery/PhaseRush/PhaseRush","Rush de phase"],8437:["Resolve/GraspOfTheUndying/GraspOfTheUndying","Poigne de l'immortel"],8439:["Resolve/VeteranAftershock/VeteranAftershock","Répercussion"],
+  8465:["Resolve/Guardian/Guardian","Gardien"],8351:["Inspiration/GlacialAugment/GlacialAugment","Amélioration glaciale"],8360:["Inspiration/UnsealedSpellbook/UnsealedSpellbook","Grimoire déchaîné"],
+  8369:["Inspiration/FirstStrike/FirstStrike","Premier coup"]};
+const STYLES={8000:["7201_Precision","Précision"],8100:["7200_Domination","Domination"],8200:["7202_Sorcery","Sorcellerie"],8300:["7203_Whimsy","Inspiration"],8400:["7204_Resolve","Volonté"]};
+const RIMG="https://ddragon.leagueoflegends.com/cdn/img/perk-images/Styles/";
+const TORD=["IRON","BRONZE","SILVER","GOLD","PLATINUM","EMERALD","DIAMOND","MASTER","GRANDMASTER","CHALLENGER"], DORD={IV:0,III:1,II:2,I:3};
+const rkScore=r=>r?TORD.indexOf(r.tier)*400+(TORD.indexOf(r.tier)>=7?r.lp:(DORD[r.div]||0)*100+r.lp):null;
+const rkFromScore=s=>{ const t=Math.min(9,Math.floor(s/400)); if(t>=7) return `${TIERS[TORD[t]][0]}`; const d=Math.floor((s%400)/100); return `${TIERS[TORD[t]][0]} ${["IV","III","II","I"][d]}`; };
+function liveGames(){ const now=Date.now(); return (D.live||[]).filter(g=>g.parts.some(x=>x.friend&&SC.has(x.puuid))&&(!g.start||now-g.start<75*60000)); }
+function liveRank(x){
+  if(x.friend){ const p=P[x.puuid]; return p?.ranks?.[D.live.find(g=>g.parts.includes(x))?.queue===440?"flex":"solo"]||null; }
+  return x.rank;
+}
+function liveFriendNotes(x,g){
+  const out=[], games=D.games.filter(gm=>gm.parts.some(p=>p.puuid===x.puuid&&p.champ===x.champ)).map(gm=>gm.parts.find(p=>p.puuid===x.puuid));
+  if(games.length){ const w=games.filter(p=>p.win).length; out.push(`${pl(games.length,"partie","parties")} sur ${x.champ} : ${fmt(w/games.length*100)} % de victoires, note moyenne ${fmt(games.reduce((a,p)=>a+p.score,0)/games.length,1)}`); }
+  else out.push(`Première partie de ${x.champ} sur le site.`);
+  const L=coachData(x.puuid,"all",null).slice(-10), cnt={}; for(const c of L) for(const k of c.m.keys||[]) cnt[k]=(cnt[k]||0)+1;
+  const top=Object.entries(cnt).sort((a,b)=>b[1]-a[1])[0];
+  if(top&&CKEY[top[0]]){ const d=L.slice().reverse().find(c=>c.m.keys.includes(top[0])).c.drill; out.push(["Rappel du coach : ",el("b",{},CKEY[top[0]][0].toLowerCase()),`. ${d.replace(/^Prochaine partie : /,"")}`]); }
+  return out;
+}
+function liveRow(x,g){
+  const r=liveRank(x), m=x.mast, name=(x.riot||"").split("#")[0];
+  const wr=r&&r.w+r.l>0?Math.round(r.w/(r.w+r.l)*100):null;
+  const sp=el("div",{class:"lsp"},x.spells.map(s=>SPELLS[s]?el("img",{src:`${DDV}/img/spell/${SPELLS[s]}.png`,alt:SPELL_FR[s]||"",title:SPELL_FR[s]||""}):el("span",{})),
+    el("span",{class:"lru"},RUNES[x.key]?el("img",{src:RIMG+RUNES[x.key][0]+".png",alt:RUNES[x.key][1],title:RUNES[x.key][1]}):null,
+      STYLES[x.sub]?el("img",{class:"sub",src:RIMG+STYLES[x.sub][0]+".png",alt:STYLES[x.sub][1],title:STYLES[x.sub][1]}):null));
+  const tags=[];
+  if(m&&m.pts>=200000) tags.push(el("span",{class:"ltag gold"},"Spécialiste"));
+  else if(m&&m.pts<10000) tags.push(el("span",{class:"ltag"},"Peu joué"));
+  if(wr!=null&&r.w+r.l>=30&&wr>=58) tags.push(el("span",{class:"ltag red"},`${wr} % de victoires`));
+  if(r&&r.w+r.l<15) tags.push(el("span",{class:"ltag"},"Peu de parties"));
+  const row=el(x.friend?"button":"div",{class:"lrow"+(x.friend?" me":""),onclick:x.friend?()=>openProfile(x.puuid):null},
+    el("div",{class:"lch"},x.champ?champImg(x.champ):el("span",{class:"noimg"})),sp,
+    el("div",{class:"lwho"},el("b",{},name),el("div",{},x.champ||"?"),el("div",{class:"lrk"},r?tierTxt(r):el("span",{class:"mut"},"Non classé"),wr!=null?el("span",{class:"mut"},`, ${wr} % sur ${r.w+r.l}`):null),
+      m?el("div",{class:"mut lm"},`Maîtrise ${m.lvl}, ${fmt(m.pts)} points`):null, tags.length?el("div",{class:"ltags"},tags):null));
+  return x.friend?[row,el("ul",{class:"tips lnotes"},liveFriendNotes(x,g).map(t=>el("li",{},t)))]:row;
+}
+function liveCard(g){
+  const now=Date.now(), mine=g.parts.find(x=>x.friend&&SC.has(x.puuid))?.team||100;
+  const sides=[mine,mine===100?200:100];
+  const avg=t=>{ const v=g.parts.filter(x=>x.team===t).map(x=>rkScore(liveRank(x))).filter(v=>v!=null); return v.length?v.reduce((a,b)=>a+b,0)/v.length:null; };
+  const a0=avg(sides[0]), a1=avg(sides[1]);
+  const fr=g.parts.filter(x=>x.friend), dur=g.start?Math.max(1,Math.round((now-g.start)/60000)):null;
+  const head=el("div",{class:"lhead"},el("div",{},el("h3",{},g.mode),el("div",{class:"mut"},dur?`Commencée il y a ${pl(dur,"minute","minutes")}`:"Écran de chargement",
+    (()=>{ const n=Math.round((now-D.generated)/60000); return n<1?". Infos à jour.":`. Infos de la mise à jour d'il y a ${pl(n,"minute","minutes")}.`; })())),
+    a0!=null&&a1!=null?el("div",{class:"lavg"},el("div",{},el("span",{class:"mut"},"Niveau moyen"),el("b",{class:"teal"},rkFromScore(a0)),el("span",{class:"mut"}," contre "),el("b",{class:"red"},rkFromScore(a1)))):null);
+  const duo=fr.length>=2?(()=>{ const ids=fr.map(x=>x.puuid); const tg=D.games.filter(gm=>ids.every(id=>gm.parts.some(p=>p.puuid===id&&p.team===gm.parts.find(q=>q.puuid===ids[0]).team)));
+    const w=tg.filter(gm=>gm.parts.find(p=>p.puuid===ids[0]).win).length;
+    return el("p",{class:"lduo"},`${fr.map(x=>P[x.puuid]?.name||x.riot).join(" et ")} jouent ensemble. `,tg.length?`Sur le site : ${pl(tg.length,"partie","parties")} ensemble, ${fmt(w/tg.length*100)} % de victoires.`:"Première partie ensemble sur le site."); })():null;
+  const bans=t=>el("div",{class:"lbans"},g.bans.filter(b=>b.team===t).map(b=>b.champ?el("span",{class:"ban"},champImg(b.champ)):el("span",{class:"ban none",title:"Pas de ban"})));
+  const team=(t,lab,cls)=>el("div",{class:"lteam "+cls},el("div",{class:"lth"},el("b",{},lab),bans(t)),g.parts.filter(x=>x.team===t).map(x=>liveRow(x,g)));
+  return el("div",{class:"lcard"},head,duo,el("div",{class:"lgrid"},team(sides[0],"Votre équipe","ally"),team(sides[1],"Adversaires","foe")));
+}
+function liveTab(m){
+  const L=liveGames();
+  m.append(el("h2",{},"En game"),el("p",{class:"lead"},"La partie en cours de tes potes : la draft, les bans, les sorts, les runes, le rang et la maîtrise de chaque joueur. Le site se met à jour toutes les 10 minutes environ, la partie peut donc avoir commencé un peu avant d'apparaître."));
+  if(!L.length){ m.append(el("p",{class:"empty-state"},"Personne n'est en game en ce moment.")); return; }
+  m.append(...L.map(liveCard));
 }
 
 /* ---------- matchups ---------- */
@@ -2788,6 +2935,12 @@ def main():
                 if p.get("live") and not p["live"].get("champ"):
                     p["live"]["champ"] = names.get(p["live"].get("champId"))
         data = build_report(players, matches, timelines, ddv, cfg["mois"], cfg["min_parties_classement"], demo)
+        if LIVE_GAMES:
+            names = champion_names(ddv) if ddv else {}
+            for gm in LIVE_GAMES.values():
+                for x in gm["parts"] + gm["bans"]:
+                    x.setdefault("champ", names.get(x.get("champId")))
+        data["live"] = list(LIVE_GAMES.values())
         data.update(structures_payload(cfg, players))
         for p in data["players"]:
             p["structs"] = next((x.get("structs", []) for x in players if x["puuid"] == p["puuid"]), [])
