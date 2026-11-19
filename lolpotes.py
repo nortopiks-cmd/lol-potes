@@ -31,6 +31,9 @@ DEFAULT_CONFIG = {
     "mois": 3,
     "max_parties_par_joueur": 300,
     "revues_max": 150,
+    "max_normales_aram": 80,
+    "revues_normales": 30,
+    "paris_salon": "",
     "min_parties_classement": 3,
     "site_url": "",
     "alertes": {"parties": True, "exploits": True, "series": True, "rangs": True, "joueur_du_mois": True, "en_game": False},
@@ -38,6 +41,7 @@ DEFAULT_CONFIG = {
 DEFAULT_POINTS = {"victoire": 3, "defaite": 1, "bonne_partie": 1, "partie_parfaite": 2, "quadra": 2, "penta": 5,
                   "max_parties_par_jour": 8, "membres_comptes": 10}
 QUEUES = {420: "solo", 440: "flex"}
+CASUAL = {400: "norm", 430: "norm", 490: "norm", 480: "norm", 450: "aram"}   # normales et ARAM : onglet à part, hors classement
 QUEUE_NAMES = {420: "Ranked solo/duo", 440: "Ranked flex"}
 
 
@@ -71,10 +75,12 @@ class Riot:
         self.calls = collections.deque()
         os.makedirs(CACHE, exist_ok=True)
         vf = os.path.join(CACHE, "version.txt")
-        if not os.path.exists(vf) or open(vf).read().strip() != CACHE_VERSION:
+        old = open(vf).read().strip() if os.path.exists(vf) else ""
+        if old != CACHE_VERSION:
             n = 0
+            pref = ("t_",) if old == "3" else ("m_", "t_")      # v3 -> v4 : seules les timelines changent
             for f in os.listdir(CACHE):
-                if f.startswith(("m_", "t_")) and f.endswith(".json"):
+                if f.startswith(pref) and f.endswith(".json"):
                     os.remove(os.path.join(CACHE, f)); n += 1
             if n:
                 say(f"Nouvelle version des revues : {n} fichiers de cache seront relus (une seule fois, ça peut prendre un moment).")
@@ -282,7 +288,7 @@ CH_KEYS = ["soloKills", "skillshotsDodged", "skillshotsHit", "controlWardsPlaced
            "maxCsAdvantageOnLaneOpponent", "visionScoreAdvantageLaneOpponent", "earlyLaningPhaseGoldExpAdvantage",
            "laningPhaseGoldExpAdvantage", "enemyJungleMonsterKills", "killsNearEnemyTurret", "survivedSingleDigitHpCount",
            "outnumberedKills", "effectiveHealAndShielding", "wardTakedowns", "stealthWardsPlaced", "visionScorePerMinute"]
-CACHE_VERSION = "3"
+CACHE_VERSION = "4"
 
 
 def compact_match(m):
@@ -311,7 +317,7 @@ def compact_timeline(t):
     frames = []
     for fr in t["info"].get("frames", []):
         frames.append({"timestamp": fr.get("timestamp"),
-                       "participantFrames": {k: dict({x: v.get(x, 0) for x in ("totalGold", "minionsKilled", "jungleMinionsKilled", "level", "xp")},
+                       "participantFrames": {k: dict({x: v.get(x, 0) for x in ("totalGold", "currentGold", "minionsKilled", "jungleMinionsKilled", "level", "xp")},
                                                      position=v.get("position"))
                                              for k, v in fr.get("participantFrames", {}).items()},
                        "events": [{k: e[k] for k in ev_keys if k in e} for e in fr.get("events", []) if e.get("type") in keep]})
@@ -461,7 +467,7 @@ def build_report(players, matches, timelines, ddv, months, min_games, demo=False
     games = []
     for mid, m in matches.items():
         info = m["info"]
-        q = QUEUES.get(info.get("queueId"))
+        q = QUEUES.get(info.get("queueId")) or CASUAL.get(info.get("queueId"))
         if not q or is_remake(info):
             continue
         minutes = info["gameDuration"] / 60
@@ -481,6 +487,8 @@ def build_report(players, matches, timelines, ddv, months, min_games, demo=False
                    "gold": p["goldEarned"], "dmg": p["totalDamageDealtToChampions"], "vis": p["visionScore"],
                    "items": [p.get(f"item{i}", 0) for i in range(7)], "lvl": p.get("champLevel", 0),
                    "score": game_score(p, team_k[p["teamId"]], team_d[p["teamId"]], minutes), "friend": fr}
+            if q == "aram":   # pas de farm ni de vision en ARAM : la note est ramenée sur 10
+                row["score"] = round(min(10, row["score"] * 1.25), 1)
             if fr:
                 row.update({"kp": (p["kills"] + p["assists"]) / max(1, team_k[p["teamId"]]),
                             "fb": 1 if p.get("firstBloodKill") else 0, "penta": p.get("pentaKills", 0), "quadra": p.get("quadraKills", 0),
@@ -501,7 +509,9 @@ def build_report(players, matches, timelines, ddv, months, min_games, demo=False
             "review": rv, "ext": ext,
         })
     games.sort(key=lambda g: -g["date"])
-    return {
+    casual = [g for g in games if g["q"] in ("norm", "aram")]
+    games = [g for g in games if g["q"] not in ("norm", "aram")]
+    return {"casual": casual,
         "generated": int(time.time() * 1000), "months": months, "minGames": min_games, "ddv": ddv, "demo": demo,
         "players": [{"puuid": p["puuid"], "name": p["name"], "tag": p["tag"], "ranks": p.get("ranks", {}), "icon": p.get("icon"),
                      "lp": p.get("lp", []), "live": p.get("live"), "structs": p.get("structs", [])} for p in players],
@@ -511,6 +521,7 @@ def build_report(players, matches, timelines, ddv, months, min_games, demo=False
 
 # --------------------------------------------------------------------------- récupération réelle
 LIVE_GAMES = {}
+MISSING = []        # Riot ID introuvables (affichés dans le panneau d'admin)
 
 
 def live_game(api, g, known):
@@ -550,12 +561,14 @@ def fetch_all(cfg):
     for rid in roster_ids(cfg):
         if "#" not in rid:
             say(f"⚠ « {rid} » ignoré : il faut le Riot ID complet, ex. Pseudo#EUW")
+            MISSING.append(rid)
             continue
         name, tag = rid.rsplit("#", 1)
         if rid.lower() not in accs:
             a = api.account(name, tag)
             if not a:
                 say(f"⚠ Compte introuvable : {rid}")
+                MISSING.append(rid)
                 continue
             accs[rid.lower()] = a["puuid"]
         players.append({"name": name, "tag": tag, "puuid": accs[rid.lower()], "rid": rid})
@@ -583,6 +596,8 @@ def fetch_all(cfg):
         ids = set()
         for qid in QUEUES:
             ids.update(api.match_ids(p["puuid"], qid, start, cfg["max_parties_par_joueur"]))
+        for qid in CASUAL:
+            ids.update(api.match_ids(p["puuid"], qid, start, cfg.get("max_normales_aram", 80)))
         p["ids"] = ids
     all_ids = sorted(set().union(*[p["ids"] for p in players]), reverse=True)
     say(f"{len(all_ids)} parties à lire (déjà en cache : {sum(os.path.exists(os.path.join(CACHE, 'm_' + i + '.json')) for i in all_ids)})")
@@ -593,7 +608,10 @@ def fetch_all(cfg):
             matches[mid] = m
         if n % 10 == 0:
             say(f"   parties : {n}/{len(all_ids)}")
-    for n, mid in enumerate(all_ids[: cfg["revues_max"]], 1):
+    qof = lambda i: matches.get(i, {}).get("info", {}).get("queueId")
+    want = [i for i in all_ids if qof(i) in QUEUES][: cfg["revues_max"]] + \
+           [i for i in all_ids if CASUAL.get(qof(i)) == "norm"][: cfg.get("revues_normales", 30)]
+    for n, mid in enumerate(want, 1):
         t = api.timeline(mid)
         if t:
             timelines[mid] = t
@@ -687,17 +705,41 @@ def demo_data(cfg, names=None):
                 ev.append({"type": "ELITE_MONSTER_KILL", "timestamp": minute * 60000, "monsterType": "BARON_NASHOR", "killerTeamId": 100 if win100 else 200})
             if minute in (14, 17, 23, 27):
                 ev.append({"type": "BUILDING_KILL", "timestamp": minute * 60000, "buildingType": "TOWER_BUILDING", "laneType": rnd.choice(["TOP_LANE", "MID_LANE", "BOT_LANE"]), "teamId": 200 if win100 else 100})
+            if minute == 0:
+                for pid in tot:
+                    ev += [{"type": "ITEM_PURCHASED", "timestamp": 15000, "participantId": pid, "itemId": 1055}, {"type": "ITEM_PURCHASED", "timestamp": 16000, "participantId": pid, "itemId": 2003}]
+            if minute in (6, 7, 8, 12, 13):
+                for pid in tot:
+                    if rnd.random() < .4:
+                        ts = minute * 60000 + rnd.randint(0, 50000)
+                        for it in rnd.choice([[1036, 2055], [1037], [1038, 2055], [1036], [1028, 1029, 2003], [1052]]):
+                            ev.append({"type": "ITEM_PURCHASED", "timestamp": ts, "participantId": pid, "itemId": it}); ts += 1500
+            if minute in (4, 6, 8, 11, 13) and rnd.random() < .5:
+                ev.append({"type": "TURRET_PLATE_DESTROYED", "timestamp": minute * 60000 + 20000, "killerId": rnd.randint(1, 10), "teamId": rnd.choice([100, 200])})
             if minute in (11, 13, 15, 17, 19):
                 for pid in tot:
                     if rnd.random() < .35:
                         ev.append({"type": "ITEM_PURCHASED", "timestamp": minute * 60000 + 5000, "participantId": pid, "itemId": rnd.choice([3078, 6692, 3071, 3031])})
             LANES = {"TOP": (1800, 12500), "JUNGLE": (5000, 9000), "MIDDLE": (7400, 7400), "BOTTOM": (12500, 1800), "UTILITY": (12000, 2400)}
             frames.append({"timestamp": minute * 60000, "events": ev,
-                           "participantFrames": {str(pid): {"totalGold": int(tot[pid]), "minionsKilled": csf[pid], "jungleMinionsKilled": 0,
+                           "participantFrames": {str(pid): {"totalGold": int(tot[pid]), "currentGold": rnd.randint(50, 1500), "minionsKilled": csf[pid], "jungleMinionsKilled": 0,
                                                             "level": min(18, 1 + minute // 2), "position": {"x": int(rnd.gauss(LANES[parts[pid - 1]["teamPosition"]][0], 2200)),
                                                                                                          "y": int(rnd.gauss(LANES[parts[pid - 1]["teamPosition"]][1], 2200))}} for pid in tot}})
         timelines[mid] = {"info": {"frames": frames}}
     st = int(time.time() * 1000) - 9 * 60000
+    import copy
+    for g, mid in enumerate(list(matches)[:30]):
+        cm = copy.deepcopy(matches[mid]); nid = "EUW1_C" + mid[5:]
+        aram = g % 3 != 0
+        cm["metadata"]["matchId"] = nid; cm["info"]["queueId"] = 450 if aram else 400
+        cm["info"]["gameCreation"] -= 5 * 3600 * 1000
+        for x in cm["info"]["participants"]:
+            if aram:
+                x["teamPosition"] = ""; x["kills"] += rnd.randint(2, 9); x["assists"] += rnd.randint(5, 18); x["totalMinionsKilled"] //= 3
+            x["championName"] = rnd.choice(["Ezreal", "Lux", "Jinx", "Sona", "Ziggs", "Malphite", "Seraphine", "Brand", "Veigar", "Kog'Maw", "Sett", "Garen"]) if aram else x["championName"]
+        matches[nid] = cm
+        if not aram and mid in timelines:
+            timelines[nid] = timelines[mid]
     players[1]["live"] = {"champ": "Darius", "queue": 420, "start": st, "mode": "Ranked solo/duo", "game": 1}
     players[3]["live"] = {"champ": "Thresh", "queue": 420, "start": st, "mode": "Ranked solo/duo", "game": 1}
     TIERS = ["SILVER", "GOLD", "GOLD", "PLATINUM", "EMERALD"]
@@ -778,14 +820,84 @@ LEGENDARY = set()      # objets « finis » (rempli au lancement depuis Data Dra
 MAP = 14800
 
 
+ITEM_GOLD, ITEM_NAME = {}, {}
+# repli si Data Dragon est injoignable (et pour la démo)
+DEMO_ITEMS = {1001: (300, "Bottes"), 1036: (350, "Épée longue"), 1037: (875, "Pioche"), 1038: (1300, "Épée en B.F."), 1052: (400, "Tome d'amplification"),
+              1026: (850, "Baguette explosive"), 1028: (400, "Cristal de rubis"), 1029: (300, "Cotte de mailles"), 2003: (50, "Potion de soins"),
+              2055: (75, "Balise de contrôle"), 1055: (450, "Lame de Doran"), 1056: (400, "Anneau de Doran"), 3078: (3333, "Force de la trinité"),
+              6692: (3100, "Éclipse"), 3071: (3000, "Couperet noir"), 3031: (3450, "Lame d'infini")}
+
+
 def legendary_items(ddv):
     try:
-        with urllib.request.urlopen(f"https://ddragon.leagueoflegends.com/cdn/{ddv}/data/en_US/item.json", timeout=10) as r:
+        with urllib.request.urlopen(f"https://ddragon.leagueoflegends.com/cdn/{ddv}/data/fr_FR/item.json", timeout=10) as r:
             data = json.loads(r.read().decode())["data"]
+        for i, it in data.items():
+            ITEM_GOLD[int(i)] = it.get("gold", {}).get("total", 0); ITEM_NAME[int(i)] = it.get("name", "")
         return {int(i) for i, it in data.items() if it.get("gold", {}).get("total", 0) >= 2200 and not it.get("into")
                 and "Boots" not in it.get("tags", []) and it.get("maps", {}).get("11")}
     except Exception:
         return set()
+
+
+def lane_and_backs(frames, events, by, pid, opp, team):
+    """Lane minute par minute contre l'adversaire direct, et analyse des retours en base."""
+    def fr(m, who):
+        return frames[m].get("participantFrames", {}).get(str(who)) if 0 <= m < len(frames) else None
+    def cs(f):
+        return f.get("minionsKilled", 0) + f.get("jungleMinionsKilled", 0)
+    lane = []
+    if opp:
+        for m in range(1, min(len(frames), 16)):
+            a, b = fr(m, pid), fr(m, opp)
+            if a and b:
+                lane.append([m, cs(a), cs(b), a["totalGold"] - b["totalGold"], a.get("level", 0), b.get("level", 0)])
+    mine = []
+    for e in events:
+        t = e.get("timestamp", 0) / 60000
+        if t > 15.5:
+            continue
+        if e.get("type") == "CHAMPION_KILL" and e.get("killerId") == pid:
+            mine.append([round(t, 2), "kill"])
+        elif e.get("type") == "CHAMPION_KILL" and e.get("victimId") == pid:
+            mine.append([round(t, 2), "death"])
+        elif e.get("type") == "CHAMPION_KILL" and pid in e.get("assistingParticipantIds", []):
+            mine.append([round(t, 2), "assist"])
+        elif e.get("type") == "TURRET_PLATE_DESTROYED" and e.get("killerId") == pid:
+            mine.append([round(t, 2), "plate"])
+    # retours en base = achats groupés (moins de 40 s d'écart)
+    buys = sorted((e["timestamp"] / 60000, e.get("itemId")) for e in events if e.get("type") == "ITEM_PURCHASED" and e.get("participantId") == pid)
+    groups = []
+    for t, it in buys:
+        if groups and t - groups[-1]["t2"] < 0.67:
+            groups[-1]["items"].append(it); groups[-1]["t2"] = t
+        else:
+            groups.append({"t": t, "t2": t, "items": [it]})
+    name = lambda i: ITEM_NAME.get(i) or DEMO_ITEMS.get(i, (0, ""))[1]
+    backs = []
+    for g in groups:
+        if g["t"] < 1.5:              # achats de départ
+            continue
+        m0 = int(g["t"])
+        a, b = fr(m0, pid), fr(m0 + 1, pid)
+        avail = left = None
+        if a and b and "currentGold" in a:
+            earn = b["totalGold"] - a["totalGold"]
+            avail = round(a["currentGold"] + earn * (g["t"] - m0))
+            left = max(0, round(b["currentGold"] - earn * (m0 + 1 - g["t2"])))
+        spent = max(0, avail - left) if avail is not None else None
+        lost_cs = None
+        if opp and fr(m0 + 2, pid) and fr(m0 + 2, opp) and a and fr(m0, opp):
+            lost_cs = (cs(fr(m0 + 2, opp)) - cs(fr(m0, opp))) - (cs(fr(m0 + 2, pid)) - cs(a))
+        obj = None
+        for o in events:
+            ot = o.get("timestamp", 0) / 60000
+            if 0.2 <= ot - g["t"] <= 1.5 and o.get("type") == "ELITE_MONSTER_KILL" and o.get("killerTeamId") not in (None, team):
+                obj = MONSTERS.get(o.get("monsterType"), "un objectif"); break
+        backs.append({"t": round(g["t"], 2), "spent": spent, "avail": avail, "left": left, "cw": 2055 in g["items"],
+                      "items": [name(i) for i in g["items"] if name(i)][:6], "lostcs": lost_cs, "obj": obj})
+    return lane, mine, backs
+
 
 
 def zone_of(x, y, team):
@@ -893,6 +1005,32 @@ def coach_game(match, tl, pid):
     enemy_jg = sum(1 for d in deaths if d["zone"] == "jungle adverse")
     cost = [d for d in deaths if d["lost"]]
 
+    lane, lane_ev, backs = lane_and_backs(frames, events, by, pid, opp["participantId"] if opp else None, team)
+    b15 = [b for b in backs if b["t"] < 20]
+    small = [b for b in b15 if b["avail"] is not None and b["avail"] < 900 and b["t"] > 3]
+    unspent = [b for b in backs if b["left"] is not None and b["left"] >= 700]
+    badtime = [b for b in backs if b["obj"]]
+    lane_txt = []
+    if len(lane) >= 6:
+        gdl = {r[0]: r[3] for r in lane}
+        best = max(((m, gdl[m] - gdl[m - 2]) for m in gdl if m - 2 in gdl), key=lambda x: abs(x[1]), default=None)
+        if best and abs(best[1]) >= 350:
+            m, d = best
+            why = [("tu tues" if k == "kill" else "tu meurs" if k == "death" else "assistance" if k == "assist" else "plaque") + f" à {mmss(t)}"
+                   for t, k in lane_ev if m - 2 <= t <= m + 0.2]
+            lane_txt.append(f"La lane bascule entre {m - 2} et {m} min : {'+' if d > 0 else ''}{fr_n(d)} or" + (f" ({', '.join(why[:3])})." if why else "."))
+        if pos != "UTILITY":
+            csd = {r[0]: r[1] - r[2] for r in lane}
+            pts = [(m, csd[m]) for m in (5, 10, 15) if m in csd]
+            if len(pts) >= 2:
+                lane_txt.append("Écart de CS : " + ", ".join(f"{'+' if v > 0 else ''}{v} à {m} min" for m, v in pts) + ".")
+                if pts[-1][1] - pts[0][1] <= -8:
+                    lane_txt.append("Le retard de farm se creuse pendant la lane : souvent des sbires perdus pendant les échanges ou les retours en base.")
+        lvd = [(r[0], r[4] - r[5]) for r in lane if r[4] - r[5] != 0]
+        if lvd and any(v <= -1 for _, v in lvd):
+            m, v = next((m, v) for m, v in lvd if v <= -1)
+            lane_txt.append(f"Premier retard de niveau à {m} min ({v}) : un niveau de retard en lane, c'est souvent un échange perdu d'avance.")
+
     # ---------- axes de travail (classés par importance)
     work, good, moments = [], [], []
 
@@ -937,8 +1075,9 @@ def coach_game(match, tl, pid):
             f"Objectif pour un {ROLE_FR.get(pos, 'joueur')} : {fr_n(T['vpm'], 1)}. Pose ta balise jaune dès qu'elle est prête, et pense à la lentille de balayage en milieu de partie.",
             round(vpm, 2), T["vpm"])
     if cw is not None and minutes > 18 and cw < T["cw"]:
+        bk = f" Sur tes {len(backs)} retours en base, tu en as acheté {sum(b['cw'] for b in backs)}." if len(backs) >= 3 else ""
         add("control_wards", 1 + T["cw"] - cw, f"{cw} balise{'s' if cw > 1 else ''} de contrôle posée{'s' if cw > 1 else ''}",
-            f"Objectif : {T['cw']} par partie au moins. Achète-en une à chaque retour en base (75 or) et pose-la près du prochain objectif.",
+            f"Objectif : {T['cw']} par partie au moins.{bk} Achète-en une à chaque retour en base (75 or) et pose-la près du prochain objectif.",
             cw, T["cw"])
     if kp is not None and minutes > 15 and kp < T["kp"] - 15:
         add("kp", 1 + (T["kp"] - kp) / 10, f"Participation aux kills : {fr_n(kp)} %",
@@ -952,6 +1091,18 @@ def coach_game(match, tl, pid):
         add("first_item", 1 + (first_item - 14) / 2, f"Premier objet fini à {mmss(first_item)}",
             "Repère : vers 12-14 min. Récupère les vagues qui arrivent sur ta lane et rentre en base avec assez d'or pour un gros composant.",
             round(first_item, 1), 14, " min")
+    if len(small) >= 2:
+        add("small_backs", 1.5 + len(small) * 0.5, f"{len(small)} retours en base avec moins de 900 or",
+            "Chaque retour coûte une ou deux vagues. Si tu n'es pas obligé de rentrer (PV ou mana bas), attends d'avoir 1 100 à 1 300 or pour un gros composant, et rentre après avoir poussé ta vague.",
+            len(small), 0)
+    if unspent:
+        b = unspent[0]
+        add("unspent", 1.5 + len(unspent) * 0.5, f"Reparti avec environ {fr_n(b['left'])} or non dépensés à {mmss(b['t'])}",
+            "De l'or dans la poche ne sert à rien en lane. Achète au moins un composant ou une balise de contrôle avant de ressortir.", len(unspent), 0)
+    if badtime:
+        b = badtime[0]
+        add("back_timing", 2 + len(badtime), f"Retour à {mmss(b['t'])}, juste avant que l'adversaire prenne {b['obj']}",
+            "Avant de rentrer, regarde le minuteur des objectifs (Tab). S'il apparaît dans moins d'une minute, rentre après, ou rentre plus tôt pour revenir à temps.", len(badtime), 0)
     if plates is not None and pos in ("TOP", "MIDDLE", "BOTTOM") and gd[15] is not None and gd[15] >= 500 and plates == 0:
         add("plates", 1.5, "Lane gagnée mais aucune plaque de tour",
             "Une plaque vaut 125 or (jusqu'à 14 min). Quand ton adversaire rentre en base ou meurt, frappe sa tour.", 0, 2)
@@ -1006,6 +1157,9 @@ def coach_game(match, tl, pid):
         "damage": "Prochaine partie : en combat, tape la cible la plus proche plutôt que de chercher le carry adverse.",
         "first_item": "Prochaine partie : note ton premier objet fini, et vise 13 min.",
         "plates": "Prochaine partie : à chaque mort ou retour en base de ton adversaire, va frapper sa tour.",
+        "small_backs": "Prochaine partie : avant chaque retour, vérifie ton or (vise 1 100 or ou plus) et pousse ta vague sous la tour adverse.",
+        "unspent": "Prochaine partie : ne ressors jamais de la base avec plus de 500 or en poche.",
+        "back_timing": "Prochaine partie : appuie sur Tab avant chaque retour pour voir quand le prochain dragon apparaît.",
     }
     score = game_score(me, sum(p["kills"] for p in parts if p["teamId"] == team),
                        sum(p["totalDamageDealtToChampions"] for p in parts if p["teamId"] == team), minutes)
@@ -1014,7 +1168,8 @@ def coach_game(match, tl, pid):
     return {
         "grade": grade, "good": good[:4], "work": work[:4], "moments": moments[:8],
         "drill": DRILLS.get(work[0]["key"]) if work else "Belle partie : garde les mêmes habitudes et vise une note encore plus haute.",
-        "m": {"cs10": cs10, "cs10t": T["cs10"], "vpm": round(vpm, 2), "vpmt": T["vpm"], "cw": cw, "cwt": T["cw"], "d14": d14,
+        "lane": lane, "laneEv": lane_ev, "laneTxt": lane_txt, "backs": backs[:10],
+        "m": {"smallb": len(small), "unspent": len(unspent), "badback": len(badtime), "backs15": sum(1 for b in backs if b["t"] < 15), "cs10": cs10, "cs10t": T["cs10"], "vpm": round(vpm, 2), "vpmt": T["vpm"], "cw": cw, "cwt": T["cw"], "d14": d14,
               "alone": alone_n, "kp": round(kp) if kp is not None else None, "kpt": T["kp"], "gd15": gd[15], "first": round(first_item, 1) if first_item else None,
               "zones": dict(zones), "deaths": len(deaths), "costly": len(cost), "keys": [w["key"] for w in work]},
     }
@@ -1321,6 +1476,150 @@ def league_event_alerts(cfg, data, league_hook, hooks):
     json.dump({"done": sorted(done | sent)}, open(fp, "w", encoding="utf-8"))
 
 
+# --------------------------------------------------------------------------- paris entre potes (bot Discord)
+# Le bot poste un message quand un pote lance une partie, ajoute ✅ et ❌, relève les votes à la mise à jour
+# suivante (les paris ferment), puis annonce le résultat et met à jour le classement des pronostiqueurs.
+YES, NO = "✅", "❌"
+
+
+def bot_req(token, method, path, body=None):
+    url = "https://discord.com/api/v10" + path
+    data = json.dumps(body).encode() if body is not None else None
+    for attempt in range(4):
+        req = urllib.request.Request(url, data=data, method=method, headers={
+            "Authorization": "Bot " + token, "User-Agent": "DiscordBot (lolpotes, 1.0)", "Content-Type": "application/json"})
+        try:
+            with urllib.request.urlopen(req, timeout=15) as r:
+                raw = r.read().decode() or "null"
+                return json.loads(raw)
+        except urllib.error.HTTPError as e:
+            if e.code == 429 and attempt < 3:
+                try:
+                    time.sleep(float(json.loads(e.read().decode()).get("retry_after", 1)) + 0.2)
+                except Exception:
+                    time.sleep(2)
+                continue
+            if e.code in (401, 403):
+                raise RiotError("Bot Discord refusé : vérifie le secret DISCORD_BOT_TOKEN et que le bot a accès au salon des paris "
+                                "(Voir le salon, Envoyer des messages, Ajouter des réactions, Lire l'historique).")
+            if e.code == 404:
+                return None
+            raise RiotError(f"Discord a répondu {e.code}")
+    return None
+
+
+def bet_voters(token, ch, msg, emoji):
+    users = bot_req(token, "GET", f"/channels/{ch}/messages/{msg}/reactions/{urllib.parse.quote(emoji)}?limit=100") or []
+    return {u["id"]: (u.get("global_name") or u.get("username") or "?") for u in users if not u.get("bot")}
+
+
+def run_bets(cfg, live_games, players, token, ch, platform):
+    """Gère les paris ; renvoie le résumé affiché sur le site."""
+    fp = os.path.join(CACHE, "paris.json")
+    st = json.load(open(fp, encoding="utf-8")) if os.path.exists(fp) else {"open": {}, "done": [], "scores": {}}
+    now = int(time.time() * 1000)
+    names = {p["puuid"]: p["name"] for p in players}
+    api = None
+    done_ids = {d["id"] for d in st["done"]}
+    try:
+        # 1. nouvelles parties : on ouvre les paris
+        for g in live_games:
+            gid = str(g["id"])
+            fr = [x for x in g["parts"] if x.get("friend")]
+            if not fr or gid in st["open"] or gid in done_ids or len({x["team"] for x in fr}) != 1:
+                continue
+            who = " et ".join(f"**{names.get(x['puuid'], x['riot'].split('#')[0])}** ({x.get('champ') or '?'})" for x in fr)
+            msg = bot_req(token, "POST", f"/channels/{ch}/messages", {"content":
+                f"🎲 **Pari** : {who} en {g['mode']}.\nVictoire {YES} ou défaite {NO} ? Réagis avant la prochaine mise à jour du site (environ 10 min) : ensuite, les paris sont fermés."})
+            if not msg:
+                continue
+            for e in (YES, NO):
+                bot_req(token, "PUT", f"/channels/{ch}/messages/{msg['id']}/reactions/{urllib.parse.quote(e)}/@me")
+                time.sleep(0.3)
+            st["open"][gid] = {"msg": msg["id"], "posted": now, "team": fr[0]["team"], "friends": [x["puuid"] for x in fr],
+                               "names": [names.get(x["puuid"], "?") for x in fr], "champs": [x.get("champ") for x in fr],
+                               "mode": g["mode"], "locked": False, "votes": {}}
+            say(f"   pari ouvert : {', '.join(st['open'][gid]['names'])}")
+        # 2. paris ouverts depuis la mise à jour précédente : on relève les votes et on ferme
+        for gid, b in st["open"].items():
+            if b["locked"] or now - b["posted"] < 4 * 60000:
+                continue
+            y, n = bet_voters(token, ch, b["msg"], YES), bet_voters(token, ch, b["msg"], NO)
+            b["votes"] = {u: {"n": nm, "v": "win"} for u, nm in y.items() if u not in n}
+            b["votes"].update({u: {"n": nm, "v": "loss"} for u, nm in n.items() if u not in y})
+            b["locked"] = True
+            ny = sum(v["v"] == "win" for v in b["votes"].values())
+            bot_req(token, "POST", f"/channels/{ch}/messages", {"content": f"🔒 Paris fermés pour {' et '.join(b['names'])} : {ny} {YES}, {len(b['votes']) - ny} {NO}.",
+                                                                "message_reference": {"message_id": b["msg"], "fail_if_not_exists": False}})
+        # 3. parties terminées : résultat et points
+        for gid in list(st["open"]):
+            b = st["open"][gid]
+            if not b["locked"]:
+                continue
+            if api is None:
+                key = os.environ.get("RIOT_API_KEY") or cfg.get("cle_api", "")
+                api = Riot(key, cfg["serveur"], cfg["region"])
+            m = api.get(api.region, f"/lol/match/v5/matches/{platform.upper()}_{gid}")
+            if not m:
+                if now - b["posted"] > 3 * 3600 * 1000:
+                    del st["open"][gid]
+                continue
+            info = m["info"]
+            me = next((p for p in info["participants"] if p["puuid"] in b["friends"]), None)
+            if not me or is_remake(info):
+                bot_req(token, "POST", f"/channels/{ch}/messages", {"content": f"↩️ Partie annulée (remake) : paris remboursés.",
+                                                                    "message_reference": {"message_id": b["msg"], "fail_if_not_exists": False}})
+                del st["open"][gid]
+                continue
+            res = "win" if me["win"] else "loss"
+            good = []
+            for u, v in b["votes"].items():
+                sc = st["scores"].setdefault(u, {"n": v["n"], "ok": 0, "tot": 0, "serie": 0, "best": 0})
+                sc["n"] = v["n"]; sc["tot"] += 1
+                if v["v"] == res:
+                    sc["ok"] += 1; sc["serie"] += 1; sc["best"] = max(sc["best"], sc["serie"]); good.append(v["n"])
+                else:
+                    sc["serie"] = 0
+            txt = f"{'🏆 Victoire' if res == 'win' else '💀 Défaite'} pour {' et '.join(b['names'])}. "
+            txt += (f"Bien vu : {', '.join(good)} ({len(good)}/{len(b['votes'])})." if good else ("Personne n'avait vu juste." if b["votes"] else "Personne n'avait parié."))
+            bot_req(token, "POST", f"/channels/{ch}/messages", {"content": txt, "message_reference": {"message_id": b["msg"], "fail_if_not_exists": False}})
+            st["done"].append({"id": gid, "date": b["posted"], "names": b["names"], "champs": b["champs"], "mode": b["mode"], "res": res,
+                               "votes": len(b["votes"]), "yes": sum(v["v"] == "win" for v in b["votes"].values()), "good": good})
+            del st["open"][gid]
+    except RiotError as e:
+        say(f"⚠ Paris : {e}")
+    st["done"] = st["done"][-200:]
+    json.dump(st, open(fp, "w", encoding="utf-8"), ensure_ascii=False)
+    return bets_summary(st)
+
+
+def bets_summary(st):
+    sc = sorted(st["scores"].values(), key=lambda s: (-s["ok"], -(s["ok"] / max(1, s["tot"]))))
+    return {"scores": [{"n": s["n"], "ok": s["ok"], "tot": s["tot"], "serie": s["serie"], "best": s["best"]} for s in sc[:30]],
+            "recent": st["done"][-10:][::-1],
+            "open": [{"names": b["names"], "champs": b["champs"], "mode": b["mode"], "locked": b["locked"], "votes": len(b["votes"])} for b in st["open"].values()]}
+
+
+def demo_bets():
+    rnd = random.Random(3)
+    st = {"open": {"1": {"names": ["Kevin", "Mehdi"], "champs": ["Darius", "Thresh"], "mode": "Ranked solo/duo", "locked": False, "votes": {}}},
+          "done": [], "scores": {}}
+    who = ["Toi", "Kevin", "Sarah", "Mehdi", "Lucas", "Inès"]
+    now = int(time.time() * 1000)
+    for i in range(14):
+        res = rnd.choice(["win", "loss"]); good = [w for w in who if rnd.random() < .55]
+        st["done"].append({"id": str(i), "date": now - (14 - i) * 9 * 3600e3, "names": [rnd.choice(who[:5])], "champs": [rnd.choice(["Darius", "Ahri", "Jinx", "Thresh", "Lee Sin"])],
+                           "mode": "Ranked solo/duo", "res": res, "votes": 6, "yes": rnd.randint(1, 5), "good": good})
+        for w in who:
+            s = st["scores"].setdefault(w, {"n": w, "ok": 0, "tot": 0, "serie": 0, "best": 0})
+            s["tot"] += 1
+            if w in good:
+                s["ok"] += 1; s["serie"] += 1; s["best"] = max(s["best"], s["serie"])
+            else:
+                s["serie"] = 0
+    return bets_summary(st)
+
+
 # --------------------------------------------------------------------------- appli téléphone (PWA)
 ICONS = {'icon-192.png': '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', 'icon-512.png': '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', 'apple-touch-icon.png': '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'}
 
@@ -1567,6 +1866,29 @@ tr.me td{background:rgba(212,173,98,.07)}
 .zbars div{display:grid;grid-template-columns:120px 1fr 48px;gap:8px;align-items:center;font-size:13.5px;padding:3px 0}
 .zbars i{height:8px;border-radius:4px;background:var(--red);opacity:.8;display:block}
 .zbars b{text-align:right;font-family:var(--cond)}
+.backs .bk{display:grid;grid-template-columns:44px 1fr;gap:8px;padding:5px 0;border-bottom:1px dashed var(--line);font-size:13.5px}
+.backs .num{color:var(--gold);font-size:15px}
+.defi{background:linear-gradient(135deg,rgba(212,173,98,.14),rgba(212,173,98,.03));border:1px solid rgba(212,173,98,.45);border-radius:14px;padding:12px 14px;margin:12px 0}
+.defi.done{background:linear-gradient(135deg,rgba(60,199,191,.16),rgba(60,199,191,.03));border-color:rgba(60,199,191,.55)}
+.defi .dh{display:flex;justify-content:space-between;gap:8px;font-size:13px}
+.defi .dl{font-family:var(--cond);font-weight:700;color:var(--gold);font-size:16px}.defi.done .dl{color:var(--teal)}
+.defi .dt{display:block;font-family:var(--cond);font-size:22px;line-height:1.15;margin:4px 0 8px}
+.dprog{display:flex;align-items:center;gap:6px;font-size:13.5px}
+.dprog i{width:28px;height:8px;border-radius:4px;background:var(--night);border:1px solid var(--line)}
+.dprog i.on{background:var(--gold);border-color:var(--gold)}.defi.done .dprog i.on{background:var(--teal);border-color:var(--teal)}
+.dprog.sm i{width:16px;height:6px}
+.dres{display:flex;gap:6px;flex-wrap:wrap;margin-top:8px}
+.dg{position:relative;padding:0;border:2px solid var(--line);border-radius:9px;background:none;cursor:pointer;width:40px;height:40px;overflow:hidden}
+.dg img{width:100%;height:100%;display:block}.dg span{position:absolute;right:1px;bottom:0;font-weight:800;font-size:13px;text-shadow:0 0 3px #000}
+.dg.ok{border-color:var(--teal)}.dg.ok span{color:var(--teal)}.dg.ko{border-color:var(--red)}.dg.ko span{color:var(--red)}
+.dboard{display:grid;gap:4px}
+.drow{display:grid;grid-template-columns:28px 1fr auto;gap:10px;align-items:center;padding:7px 8px;border:1px solid var(--line);border-radius:10px;background:var(--ink);color:inherit;text-align:left;font:inherit;cursor:pointer}
+.bet{display:grid;grid-template-columns:auto 1fr;gap:12px;align-items:center;padding:9px 4px;border-bottom:1px solid var(--line)}
+.bet .dot{width:10px;height:10px;border-radius:50%;background:var(--mut)}.bet .dot.on{background:var(--red)}
+.pstat{font-size:12.5px;padding:1px 8px;border-radius:999px;border:1px solid var(--line)}
+.pstat.ok{color:var(--teal);border-color:rgba(60,199,191,.5)}.pstat.ko{color:var(--red);border-color:rgba(226,90,80,.5)}.pstat.wait{color:var(--gold);border-color:rgba(212,173,98,.5)}
+
+.av-sm{width:24px;height:24px;border-radius:50%;vertical-align:middle}
 .ldot{display:inline-block;width:8px;height:8px;border-radius:50%;background:var(--red);margin-left:6px;vertical-align:middle}
 .lcard{background:var(--ink);border:1px solid var(--line);border-radius:14px;padding:14px;margin:14px 0}
 .lhead{display:flex;justify-content:space-between;gap:12px;flex-wrap:wrap;align-items:flex-end}
@@ -1782,7 +2104,7 @@ const TIERS={IRON:["Fer","#8a8a8a"],BRONZE:["Bronze","#b07d58"],SILVER:["Argent"
 const tierTxt=r=>{ if(!r) return el("span",{class:"tier mut"},"Non classé"); const [n,c]=TIERS[r.tier]||[r.tier,"#aaa"];
   return el("span",{class:"tier",style:`color:${c}`},`${n}${["MASTER","GRANDMASTER","CHALLENGER"].includes(r.tier)?"":" "+r.div}, ${r.lp} LP`); };
 const POS={TOP:"Top",JUNGLE:"Jungle",MIDDLE:"Mid",BOTTOM:"ADC",UTILITY:"Support","":"–"};
-const QN={solo:"Solo/duo",flex:"Flex"};
+const QN={solo:"Solo/duo",flex:"Flex",norm:"Normale",aram:"ARAM"};
 const monthName=k=>{ if(k==="all") return "Toute la période"; const [y,m]=k.split("-").map(Number); return cap(new Date(y,m-1,1).toLocaleString("fr-FR",{month:"long",year:"numeric"})); };
 const months=[...new Set(D.games.map(g=>g.month))].sort().reverse();
 const nowKey=(()=>{const d=new Date(); return `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,"0")}`;})();
@@ -1835,9 +2157,9 @@ function renderHero(){
 }
 
 /* ---------- navigation ---------- */
-const TABS=[["board","Classement"],["live","En game"],["coach","Coach"],["postes","Postes"],["trophies","Trophées"],["wrapped","Wrapped"],["records","Records"],["charts","Graphiques"],["duel","Duel"],["games","Parties"],["duos","Duos"],["hall","Palmarès"]];
-const TABS_L=[["league","Structures"],["board","Joueurs"],["live","En game"],["coach","Coach"],["postes","Postes"],["recrut","Recrutement"],["agenda","Agenda"],["matches","Matchs"],["trophies","Trophées"],["records","Records"],["charts","Graphiques"],["lhall","Palmarès"]];
-const TABS_S=[["sfiche","Fiche"],["teams","Équipes"],["board","Classement"],["live","En game"],["coach","Coach"],["postes","Postes"],["agenda","Agenda"],["matches","Matchs"],["trophies","Trophées"],["wrapped","Wrapped"],["records","Records"],["charts","Graphiques"],["duel","Duel"],["games","Parties"],["duos","Duos"],["hall","Palmarès"]];
+const TABS=[["board","Classement"],["live","En game"],["coach","Coach"],["casual","Normales & ARAM"],["postes","Postes"],["trophies","Trophées"],["wrapped","Wrapped"],["records","Records"],["charts","Graphiques"],["duel","Duel"],["games","Parties"],["duos","Duos"],["hall","Palmarès"]];
+const TABS_L=[["league","Structures"],["board","Joueurs"],["live","En game"],["coach","Coach"],["casual","Normales & ARAM"],["postes","Postes"],["recrut","Recrutement"],["agenda","Agenda"],["matches","Matchs"],["trophies","Trophées"],["records","Records"],["charts","Graphiques"],["lhall","Palmarès"]];
+const TABS_S=[["sfiche","Fiche"],["teams","Équipes"],["board","Classement"],["live","En game"],["coach","Coach"],["casual","Normales & ARAM"],["postes","Postes"],["agenda","Agenda"],["matches","Matchs"],["trophies","Trophées"],["wrapped","Wrapped"],["records","Records"],["charts","Graphiques"],["duel","Duel"],["games","Parties"],["duos","Duos"],["hall","Palmarès"]];
 function render(){
   const y=scrollY;
   $("hero").style.display=location.hash==="#admin"?"none":"";
@@ -1851,7 +2173,7 @@ function render(){
   $("tabs").replaceChildren(...tabs.map(([k,n])=>el("button",{"aria-current":S.tab===k?"page":null,onclick:()=>{S.tab=k; render();}},n,k==="live"&&liveGames().length?el("span",{class:"ldot","aria-label":"partie en cours"}):null)));
   const m=$("main"); m.replaceChildren();
   if(D.demo) m.append(el("div",{class:"demo"},MULTI?"Exemple avec des structures, des joueurs et des parties inventés.":"Exemple avec des joueurs et des parties inventés. Mets ta clé API dans config.json et relance le programme sans --demo pour voir vos vraies parties."));
-  ({board,trophies,wrapped,records,charts,duel,games,duos,hall,league,sfiche,teams,matches,lhall:leagueHall,postes,recrut,agenda,coach:coachTab,live:liveTab})[S.tab](m);
+  ({board,trophies,wrapped,records,charts,duel,games,duos,hall,league,sfiche,teams,matches,lhall:leagueHall,postes,recrut,agenda,coach:coachTab,live:liveTab,casual:casualTab})[S.tab](m);
   scrollTo(0,y); // garde la position quand on touche un filtre
 }
 
@@ -2266,8 +2588,31 @@ const postSel=(val,on)=>{ const s=el("select",{onchange:chg(on)},el("option",{va
 const stName=id=>AD.cfg.structures.find(s=>s.id===id)?.nom||id;
 let NM={date:new Date().toISOString().slice(0,10),heure:"",a:"",b:"",sa:"",sb:"",type:"Scrim BO3",note:""};
 let ND={a:"",b:"",debut:new Date().toISOString().slice(0,10),fin:new Date(Date.now()+6*864e5).toISOString().slice(0,10),titre:""};
+const RID_RE=/^[^#]{3,16}#[A-Za-z0-9]{2,5}$/;
+function ridStatus(rid){
+  const k=rid.toLowerCase();
+  if((D.missing||[]).some(x=>x.toLowerCase()===k)) return ["introuvable : vérifie le pseudo et le tag","ko"];
+  if(D.players.some(p=>`${p.name}#${p.tag}`.toLowerCase()===k)) return ["suivi ✓","ok"];
+  return ["visible après la prochaine mise à jour","wait"];
+}
+function potesCard(c,LEAGUE){
+  const rows=c.joueurs.map((r,i)=>{ const [t,k]=ridStatus(r), p=D.players.find(x=>`${x.name}#${x.tag}`.toLowerCase()===r.toLowerCase());
+    return el("div",{class:"arow"},p?avatar(p.puuid,"av-sm"):null,el("b",{},r),el("span",{class:"pstat "+k},t),
+      p?.ranks?.solo?tierTxt(p.ranks.solo):null,
+      el("button",{class:"btn sm ghost",onclick:()=>{ if(!confirm(`Retirer ${r} du site ?`)) return; c.joueurs.splice(i,1); AD.dirty=true; adMsg(`${r} retiré (pense à enregistrer).`); }},"Retirer")); });
+  const add=()=>{ const v=$("newj").value.trim().replace(/\s*#\s*/,"#");
+    if(!RID_RE.test(v)) return adMsg("Il faut le Riot ID complet, comme dans le jeu : Pseudo#TAG (le tag fait 2 à 5 lettres ou chiffres, par exemple EUW ou 1234).",true);
+    const all=[...c.joueurs,...c.structures.flatMap(st=>[...(st.membres||[]),...(st.equipes||[]).flatMap(e=>(e.joueurs||[]).map(j=>typeof j==="string"?j:j.riot))])];
+    if(all.some(x=>String(x).toLowerCase()===v.toLowerCase())) return adMsg(`${v} est déjà suivi.`,true);
+    c.joueurs.push(v); AD.dirty=true; adMsg(`${v} ajouté. Enregistre, puis lance « Mettre à jour le site » : il apparaîtra dans quelques minutes (la première récupération de ses parties prend un peu plus longtemps).`); };
+  return acard("j",LEAGUE?`Joueurs suivis hors structure (${c.joueurs.length})`:`Les potes (${c.joueurs.length})`,!LEAGUE,
+    LEAGUE?el("p",{class:"mut"},"Les membres des structures s'ajoutent dans la fiche de chaque structure. Ici, ce sont les joueurs suivis sans structure."):null,
+    el("div",{class:"inl"},el("input",{id:"newj",placeholder:"Pseudo#TAG",autocomplete:"off",onkeydown:e=>{ if(e.key==="Enter") add(); }}),el("button",{class:"btn gold",onclick:add},"Ajouter")),
+    el("p",{class:"mut",style:"font-size:13px"},"Le Riot ID se trouve dans le client LoL, en haut à droite (ton pseudo, puis le # et le tag). Les majuscules ne comptent pas."),
+    el("div",{class:"alist"},rows.length?rows:el("p",{class:"mut"},"Aucun pote pour l'instant.")));
+}
 function admin(m){
-  m.append(el("h2",{},"Panneau d'admin"),el("p",{class:"lead"},"Ajoute des matchs, des événements d'agenda, des duels et des structures. « Enregistrer » met à jour config.json sur GitHub : le site suit à la mise à jour suivante."));
+  m.append(el("h2",{},"Panneau d'admin"),el("p",{class:"lead"},MULTI?"Ajoute des joueurs, des matchs, des événements d'agenda, des duels et des structures. « Enregistrer » met à jour config.json sur GitHub : le site suit à la mise à jour suivante.":"Ajoute ou retire des potes sans toucher au code. « Enregistrer » met à jour config.json sur GitHub, puis « Mettre à jour le site » lance la récupération des parties."));
   // connexion
   m.append(acard("cx",AD.cfg?"Connexion ✓":"Connexion",!AD.cfg,
     el("div",{class:"agrid"},fld("Pseudo GitHub",inp(AD.owner,v=>AD.owner=v.trim())),fld("Référentiel",inp(AD.repo,v=>AD.repo=v.trim())),
@@ -2280,7 +2625,9 @@ function admin(m){
         el("li",{},"Permissions → Repository permissions : Contents → Read and write, et Actions → Read and write."),
         el("li",{},"Generate token, copie-le et colle-le ici. Ne le partage avec personne.")))));
   if(!AD.cfg){ return; }
-  const c=AD.cfg;
+  const c=AD.cfg, LEAGUE=c.structures.length>0;
+  m.append(potesCard(c,LEAGUE));
+  if(LEAGUE){
   // matchs et agenda
   const mlist=c.matchs.map((x,i)=>({x,i})).sort((a,b)=>String(b.x.date).localeCompare(String(a.x.date)));
   m.append(acard("m",`Matchs et agenda (${c.matchs.length})`,true,
@@ -2316,16 +2663,14 @@ function admin(m){
     el("div",{class:"links"},c.structures.map(s=>el("button",{class:"btn"+(s.id===AD.edit?" gold":""),onclick:()=>{AD.edit=s.id; AOPEN.s=true; render();}},s.nom)),
       el("button",{class:"btn",onclick:()=>{ let n=1; while(c.structures.some(s=>s.id==="structure-"+n)) n++; c.structures.push({id:"structure-"+n,nom:"Nouvelle structure",tag:"NEW",couleur:"#3cc7bf",logo:"",description:"",discord:"",recrutement:false,reseaux:{},postes_recherches:[],niveau:"",contact:"",equipes:[],membres:[]}); AD.edit="structure-"+n; AD.dirty=true; render(); }},"+ Nouvelle structure")),
     cur?structEditor(cur):el("p",{class:"mut"},"Choisis une structure à modifier.")));
-  // joueurs hors structure + réglages + barème
-  m.append(acard("j",`Joueurs suivis hors structure (${c.joueurs.length})`,false,
-    el("div",{class:"alist"},c.joueurs.map((r,i)=>el("div",{class:"arow"},el("b",{},r),el("button",{class:"btn sm ghost",onclick:()=>{ c.joueurs.splice(i,1); AD.dirty=true; render(); }},"Retirer")))),
-    el("div",{class:"inl"},el("input",{id:"newj",placeholder:"Pseudo#TAG"}),el("button",{class:"btn",onclick:()=>{ const v=$("newj").value.trim(); if(!v.includes("#")) return adMsg("Il faut le Riot ID complet : Pseudo#TAG.",true); c.joueurs.push(v); AD.dirty=true; render(); }},"Ajouter"))));
+  }
   c.points??={...PTS};
   const PN=[["victoire","Victoire"],["defaite","Défaite"],["bonne_partie","Note de 8 ou plus"],["partie_parfaite","Partie parfaite"],["quadra","Quadrakill"],["penta","Pentakill"],["max_parties_par_jour","Parties max par jour"],["membres_comptes","Membres comptés"]];
-  m.append(acard("r","Réglages de la ligue et barème des points",false,
-    el("div",{class:"agrid"},fld("Nom de la ligue",inp(c.nom_ligue,v=>c.nom_ligue=v)),fld("Adresse du site",inp(c.site_url,v=>c.site_url=v)),
-      fld("Mois récupérés",inp(c.mois,v=>c.mois=+v||1,{type:"number",min:1,max:12})),fld("Parties min. pour être classé",inp(c.min_parties_classement,v=>c.min_parties_classement=+v||1,{type:"number",min:1}))),
-    el("div",{class:"agrid"},PN.map(([k,n])=>fld(n,inp(c.points[k]??PTS[k],v=>c.points[k]=+v||0,{type:"number",min:0}))))));
+  m.append(acard("r",LEAGUE?"Réglages de la ligue et barème des points":"Réglages",false,
+    el("div",{class:"agrid"},LEAGUE?fld("Nom de la ligue",inp(c.nom_ligue,v=>c.nom_ligue=v)):null,fld("Adresse du site",inp(c.site_url,v=>c.site_url=v)),
+      fld("Mois récupérés",inp(c.mois,v=>c.mois=+v||1,{type:"number",min:1,max:12})),fld("Parties min. pour être classé",inp(c.min_parties_classement,v=>c.min_parties_classement=+v||1,{type:"number",min:1})),
+      fld("Salon Discord des paris (identifiant)",inp(c.paris_salon||"",v=>c.paris_salon=v.trim(),{placeholder:"ex. 1234567890123456789",inputmode:"numeric"}),"Clic droit sur le salon → Copier l'identifiant (mode développeur activé). Laisse vide pour désactiver les paris.")),
+    LEAGUE?el("div",{class:"agrid"},PN.map(([k,n])=>fld(n,inp(c.points[k]??PTS[k],v=>c.points[k]=+v||0,{type:"number",min:0})))):null));
   // barre d'enregistrement
   m.append(el("div",{class:"savebar"},el("div",{class:"wrap"},
     el("span",{class:AD.err?"loss":AD.dirty?"gold":"mut"},AD.msg||(AD.dirty?"Modifications non enregistrées.":"Rien à enregistrer.")),
@@ -2376,12 +2721,13 @@ function coachCard(g,f){
     el("div",{},el("b",{class:f.gd10>=0?"win":"loss"},f.gd10!=null?(f.gd10>0?"+":"")+fmt(f.gd10):"–"),"or à 10 min",f.opp?el("div",{},"contre "+f.opp):null),
     el("div",{},el("b",{class:f.gd15>=0?"win":"loss"},f.gd15!=null?(f.gd15>0?"+":"")+fmt(f.gd15):"–"),"or à 15 min"));
   if(!c) return el("div",{class:"fcard"},head,mini,f.tips?.length?el("ul",{class:"tips"},f.tips.map(t=>el("li",{},t))):null);
-  const bar=w=>{ if(w.val==null||w.target==null||typeof w.val!=="number") return null; const lower=["early_deaths","isolated","enemy_jungle","costly_deaths","first_item"].includes(w.key);
+  const bar=w=>{ if(w.val==null||w.target==null||typeof w.val!=="number"||(w.target===0&&w.key!=="lane_lost")) return null; const lower=["early_deaths","isolated","enemy_jungle","costly_deaths","first_item"].includes(w.key);
     const max=Math.max(Math.abs(w.val),Math.abs(w.target))*1.25||1, pv=Math.max(0,Math.min(100,Math.abs(w.val)/max*100)), pt=Math.max(0,Math.min(100,Math.abs(w.target)/max*100));
     return el("div",{class:"cbar",title:`toi : ${w.val}${w.unit||""}, objectif : ${w.target}${w.unit||""}`},el("i",{style:`width:${pv}%;background:${lower?"var(--red)":"var(--gold)"}`}),el("em",{style:`left:${pt}%`})); };
   return el("div",{class:"fcard coach"},head,mini,
     c.good.length?el("div",{class:"cblock"},el("div",{class:"ct good"},"Ce qui a marché"),el("ul",{class:"tips"},c.good.map(t=>el("li",{},t)))):null,
     c.work.length?el("div",{class:"cblock"},el("div",{class:"ct work"},"À travailler"),c.work.map(w=>el("div",{class:"witem"},el("b",{},w.title),bar(w),el("p",{},w.detail)))):null,
+    laneBlock(c,f.pos),backsBlock(c),
     c.moments.length?el("div",{class:"cblock"},el("div",{class:"ct"},"Moments à revoir dans le replay"),el("div",{class:"moms"},c.moments.map(x=>el("div",{},el("span",{class:"num"},mmss(x.t)),x.txt)))):null,
     el("div",{class:"drill"},el("span",{},"Pour la prochaine partie"),c.drill));
 }
@@ -2431,15 +2777,156 @@ function coachSummary(pu,month,q){
 }
 function coachTab(m){
   if(!S.cc||!SC.has(S.cc)) S.cc=PL[0]?.puuid;
-  m.append(el("h2",{},"Le coach"),el("p",{class:"lead"},`${monthName(S.month)}, toutes ranked confondues. Le coach repère ce qui revient d'une partie à l'autre et propose 3 priorités chiffrées. Les objectifs correspondent environ au niveau Or-Platine : ce sont des repères, pas des règles absolues.`),playerChips("cc",false));
+  m.append(el("h2",{},"Le coach"),el("p",{class:"lead"},`${monthName(S.month)}, toutes ranked confondues. Le coach repère ce qui revient d'une partie à l'autre et propose 3 priorités chiffrées. Les objectifs correspondent environ au niveau Or-Platine : ce sont des repères, pas des règles absolues.`));
+  m.append(...[defiBoard()].filter(Boolean),el("div",{class:"qtitle"},"Choisis un pote"),playerChips("cc",false));
   if(!S.cc){ m.append(el("p",{class:"empty-state"},"Aucun joueur.")); return; }
-  m.append(coachSummary(S.cc,S.month,null));
+  m.append(defiBlock(S.cc,true),coachSummary(S.cc,S.month,null),...[compareBlock(S.cc)].filter(Boolean));
   const L=coachData(S.cc,S.month,null).reverse().slice(0,8);
   if(L.length) m.append(el("div",{class:"qtitle"},"Dernières parties analysées"),el("div",{class:"table"},L.map(({g,c,p})=>el("button",{class:"game",onclick:()=>openReview(g)},
     el("div",{class:"bar",style:`background:${p.win?"var(--teal)":"var(--red)"}`}),
     el("div",{},el("div",{class:"meta"},new Date(g.date).toLocaleDateString("fr-FR",{weekday:"short",day:"numeric",month:"short"})),
       el("div",{class:"ppl"},el("span",{class:"p"},champImg(p.champ),el("span",{class:"num"},`${p.k}/${p.d}/${p.a}`),el("span",{class:"mut"},c.work[0]?.title||"rien à signaler")))),
     el("span",{class:"grade",style:`--g:${GCOL[c.grade]}`},c.grade)))));
+}
+
+/* ---------- coach : lane minute par minute et retours en base ---------- */
+Object.assign(CKEY,{small_backs:["Petits retours en base","smallb",-1,"petits retours par partie",()=>0],unspent:["Or non dépensé","unspent",-1,"retours avec de l'or non dépensé",()=>0],
+  back_timing:["Retours avant un objectif","badback",-1,"retours juste avant un objectif adverse",()=>0]});
+function laneBlock(c,pos){
+  const L=c.lane||[]; if(L.length<4) return null;
+  const W=Math.round(Math.min(560,Math.max(300,innerWidth-80))),H=150,Lm=40,R=6,T=14,B=34;
+  const max=Math.max(500,...L.map(r=>Math.abs(r[3]))), bw=(W-Lm-R)/15;
+  const X=m=>Lm+(m-1)*bw, Y=v=>T+(1-(v+max)/(2*max))*(H-T-B);
+  let g=`<line x1="${Lm}" x2="${W-R}" y1="${Y(0)}" y2="${Y(0)}" stroke="#3a5263"/>`;
+  for(const v of [max,-max]) g+=`<text x="${Lm-5}" y="${Y(v)+4}" text-anchor="end" fill="#93a3aa" font-size="11" font-family="Barlow Condensed">${v>0?"+":"−"}${fmt(Math.abs(v))}</text>`;
+  for(const r of L){ const [m,,,gd]=r, y=Y(Math.max(0,gd)), h=Math.abs(Y(gd)-Y(0));
+    g+=`<rect x="${X(m)+2}" y="${gd>=0?y:Y(0)}" width="${bw-4}" height="${Math.max(1,h)}" rx="2" fill="${gd>=0?"#3cc7bf":"#e25a50"}" opacity=".85"><title>${m} min : ${gd>0?"+":""}${fmt(gd)} or, ${r[1]} CS contre ${r[2]}, niveau ${r[4]} contre ${r[5]}</title></rect>`;
+    if(pos!=="UTILITY"){ const d=r[1]-r[2]; g+=`<text x="${X(m)+bw/2}" y="${H-18}" text-anchor="middle" fill="${d>=0?"#3cc7bf":"#e25a50"}" font-size="10.5" font-family="Barlow Condensed">${d>0?"+":""}${d}</text>`; }
+    if(m%5===0) g+=`<text x="${X(m)+bw/2}" y="${H-4}" text-anchor="middle" fill="#93a3aa" font-size="11" font-family="Barlow Condensed">${m} min</text>`; }
+  const IC={kill:["⚔","#3cc7bf"],death:["✕","#e25a50"],plate:["▲","#d4ad62"],assist:["•","#3cc7bf"]};
+  for(const [t,k] of c.laneEv||[]) if(t<=15&&t>=1) g+=`<text x="${Lm+(t-1)*bw}" y="${T-2}" text-anchor="middle" fill="${IC[k][1]}" font-size="12"><title>${mmss(t)} : ${({kill:"kill",death:"mort",plate:"plaque de tour",assist:"assistance"})[k]}</title>${IC[k][0]}</text>`;
+  const s=svgEl(W,H,"Écart d'or minute par minute contre l'adversaire direct"); s.innerHTML=g;
+  return el("div",{class:"cblock"},el("div",{class:"ct"},"La lane minute par minute"),
+    el("p",{class:"mut",style:"font-size:12.5px;margin:0 0 4px"},`Barres : écart d'or contre ton adversaire direct.${pos!=="UTILITY"?" Chiffres du bas : écart de CS.":""} En haut : ⚔ kill, ✕ mort, ▲ plaque.`),
+    el("div",{class:"chart"},s),c.laneTxt?.length?el("ul",{class:"tips"},c.laneTxt.map(t=>el("li",{},t))):null);
+}
+function backsBlock(c){
+  const B=(c.backs||[]).filter(b=>b.t<25); if(!B.length) return null;
+  return el("div",{class:"cblock"},el("div",{class:"ct"},"Tes retours en base"),el("div",{class:"backs"},B.map(b=>{
+    const flags=[]; if(b.avail!=null&&b.avail<900&&b.t>3) flags.push(["petit retour","loss"]); if(b.left!=null&&b.left>=700) flags.push([`${fmt(b.left)} or non dépensés`,"loss"]);
+    if(b.obj) flags.push([`${b.obj} adverse juste après`,"loss"]); if(b.lostcs!=null&&b.lostcs>=6) flags.push([`${b.lostcs} CS d'écart pendant le retour`,"gold"]); if(b.cw) flags.push(["balise de contrôle ✓","win"]);
+    return el("div",{class:"bk"},el("span",{class:"num"},mmss(b.t)),el("div",{},el("b",{},b.avail!=null?`${fmt(b.avail)} or`:"Retour"),
+      el("span",{class:"mut"},b.items.length?` : ${b.items.join(", ")}`:""),flags.length?el("div",{class:"ltags"},flags.map(([t,k])=>el("span",{class:"ltag "+(k==="loss"?"red":k==="gold"?"gold":"")},t))):null)); })));
+}
+
+/* ---------- défi de la semaine ---------- */
+const DEFI={early_deaths:["Maximum 1 mort avant 14 min",m=>m.d14<=1],isolated:["Aucune mort loin de ton équipe",m=>m.alone===0],
+  enemy_jungle:["Aucune mort dans la jungle adverse",m=>!(m.zones?.["jungle adverse"])],costly_deaths:["Aucune mort qui coûte un objectif",m=>m.costly===0],
+  cs:[m=>`${m.cs10t} CS à 10 min ou plus`,m=>m.cs10!=null&&m.cs10t&&m.cs10>=m.cs10t],lane_lost:["Pas plus de 300 or de retard à 15 min",m=>m.gd15!=null&&m.gd15>=-300],
+  lead_thrown:["Garder ton avance : pas d'avance gâchée",m=>!m.keys.includes("lead_thrown")],vision:[m=>`Vision de ${fmt(m.vpmt,1)} par minute ou plus`,m=>m.vpm>=m.vpmt],
+  control_wards:[m=>`${m.cwt} balises de contrôle ou plus`,m=>m.cw!=null&&m.cw>=m.cwt],kp:[m=>`${m.kpt} % de participation aux kills ou plus`,m=>m.kp!=null&&m.kp>=m.kpt],
+  damage:["Assez de dégâts en combat",m=>!m.keys.includes("damage")],first_item:["Premier objet fini avant 14 min",m=>m.first!=null&&m.first<=14],
+  plates:["Prendre au moins une plaque quand tu gagnes ta lane",m=>!m.keys.includes("plates")],small_backs:["Aucun retour avec moins de 900 or",m=>m.smallb===0],
+  unspent:["Jamais plus de 700 or en poche en sortant de base",m=>m.unspent===0],back_timing:["Aucun retour juste avant un objectif adverse",m=>m.badback===0],
+  _note:["Une note de 7,5 ou plus",(m,p)=>p.score>=7.5]};
+const DEFI_N=3;
+const weekStart=t=>{ const d=new Date(t); d.setHours(0,0,0,0); d.setDate(d.getDate()-((d.getDay()+6)%7)); return d.getTime(); };
+function coachAll(pu){ const L=[]; for(const g of [...D.games,...(D.casual||[]).filter(g=>g.q==="norm")]){ const f=g.review?.friends?.find(x=>x.puuid===pu&&x.coach); if(f) L.push({g,f,c:f.coach,m:f.coach.m,p:g.parts.find(x=>x.pid===f.pid)}); } return L.sort((a,b)=>a.g.date-b.g.date); }
+function defiFor(pu,ws){
+  const all=coachAll(pu), before=all.filter(x=>x.g.date<ws).slice(-10), cnt={};
+  for(const x of before) for(const k of x.m.keys||[]) if(DEFI[k]) cnt[k]=(cnt[k]||0)+1;
+  const key=Object.entries(cnt).sort((a,b)=>b[1]-a[1]||a[0].localeCompare(b[0]))[0]?.[0]||"_note";
+  const week=all.filter(x=>x.g.date>=ws&&x.g.date<ws+7*864e5), [t,test]=DEFI[key];
+  const res=week.map(x=>({x,ok:!!test(x.m,x.p)})), ok=res.filter(r=>r.ok).length;
+  const ref=week[0]?.m||before[before.length-1]?.m;
+  return {key,title:typeof t==="function"?(ref?t(ref):"Défi"):t,res,ok,done:ok>=DEFI_N,basis:cnt[key]||0,nb:before.length};
+}
+function defiHistory(pu){
+  const all=coachAll(pu); if(!all.length) return {won:0,weeks:0};
+  let won=0,weeks=0; const cur=weekStart(Date.now());
+  for(let ws=weekStart(all[0].g.date)+7*864e5; ws<cur; ws+=7*864e5){ const d=defiFor(pu,ws); if(d.res.length){ weeks++; if(d.done) won++; } }
+  return {won,weeks};
+}
+function defiBlock(pu,big){
+  const ws=weekStart(Date.now()), d=defiFor(pu,ws), h=defiHistory(pu);
+  const end=new Date(ws+7*864e5-1).toLocaleDateString("fr-FR",{weekday:"long",day:"numeric",month:"long"});
+  return el("div",{class:"defi"+(d.done?" done":"")},
+    el("div",{class:"dh"},el("span",{class:"dl"},d.done?"Défi réussi ✓":"Défi de la semaine"),el("span",{class:"mut"},`jusqu'à ${end}`)),
+    el("b",{class:"dt"},d.title),
+    el("div",{class:"dprog"},Array.from({length:DEFI_N},(_,i)=>el("i",{class:i<d.ok?"on":""})),el("span",{},`${Math.min(d.ok,DEFI_N)}/${DEFI_N} parties réussies`)),
+    big?el("p",{class:"mut",style:"font-size:13px;margin:6px 0 0"},d.key==="_note"?"Aucun défaut récurrent sur tes dernières parties : le défi, c'est de bien jouer.":`Choisi d'après tes ${d.nb} dernières parties analysées : ce point revient dans ${d.basis} d'entre elles. Compte en ranked et en normale.`):null,
+    big&&d.res.length?el("div",{class:"dres"},d.res.map(r=>el("button",{class:"dg "+(r.ok?"ok":"ko"),onclick:()=>openReview(r.x.g),title:"Revoir la partie"},champImg(r.x.p.champ),el("span",{},r.ok?"✓":"✕")))):null,
+    big&&h.weeks?el("div",{class:"mut",style:"font-size:13px;margin-top:6px"},`Défis réussis : ${h.won} sur ${pl(h.weeks,"semaine jouée","semaines jouées")}.`):null);
+}
+function defiBoard(){
+  const ws=weekStart(Date.now()), rows=PL.map(p=>({p,d:defiFor(p.puuid,ws)})).filter(r=>r.d.nb||r.d.res.length).sort((a,b)=>b.d.ok-a.d.ok);
+  if(!rows.length) return null;
+  return el("div",{},el("div",{class:"qtitle"},"Les défis de la semaine"),el("div",{class:"dboard"},rows.map(({p,d})=>el("button",{class:"drow",onclick:()=>{S.cc=p.puuid; render();}},
+    avatar(p.puuid,"av-sm"),el("div",{},el("b",{},p.name),el("div",{class:"mut",style:"font-size:12.5px"},d.title)),
+    el("div",{class:"dprog sm"},Array.from({length:DEFI_N},(_,i)=>el("i",{class:i<d.ok?"on":""})))))));
+}
+
+/* ---------- comparaison avec un pote du même poste ---------- */
+function mainPos(pu){ const c={}; for(const g of gamesFor(S.month,null)) for(const p of g.parts) if(p.puuid===pu&&p.pos) c[p.pos]=(c[p.pos]||0)+1; return Object.entries(c).sort((a,b)=>b[1]-a[1])[0]?.[0]; }
+function compareBlock(pu){
+  const pos=mainPos(pu); if(!pos) return null;
+  const others=PL.filter(p=>p.puuid!==pu&&coachData(p.puuid,S.month,null).length);
+  if(!others.length) return null;
+  const same=others.filter(p=>mainPos(p.puuid)===pos);
+  if(!S.cmp||S.cmp===pu||!others.some(p=>p.puuid===S.cmp)) S.cmp=(same[0]||others[0]).puuid;
+  const stats=u=>{ const L=coachData(u,S.month,null).filter(x=>x.f.pos===pos), a=k=>{ const v=L.map(x=>x.m[k]).filter(v=>v!=null&&isFinite(v)); return v.length?v.reduce((s,b)=>s+b,0)/v.length:null; };
+    return {n:L.length,note:L.length?L.reduce((s,x)=>s+x.p.score,0)/L.length:null,wr:L.length?L.filter(x=>x.p.win).length/L.length*100:null,cs10:a("cs10"),gd15:a("gd15"),vpm:a("vpm"),cw:a("cw"),d14:a("d14"),kp:a("kp"),first:a("first")}; };
+  const A=stats(pu), B=stats(S.cmp);
+  const R=[["Note moyenne","note",1,1],["Victoires","wr",1,0," %"],["CS à 10 min","cs10",1,0],["Or à 15 min contre l'adversaire","gd15",1,0],["Vision par minute","vpm",1,2],["Balises de contrôle","cw",1,1],
+    ["Morts avant 14 min","d14",-1,1],["Participation aux kills","kp",1,0," %"],["Premier objet fini (min)","first",-1,1]];
+  const sel=el("select",{onchange:e=>{S.cmp=e.target.value; render();}},others.map(p=>el("option",{value:p.puuid},`${p.name}${mainPos(p.puuid)===pos?` (${POS[pos]})`:""}`))); sel.value=S.cmp;
+  const box=el("div",{},el("div",{class:"qtitle"},`Comparaison au poste ${POS[pos]}`),
+    el("div",{class:"inl",style:"margin-bottom:8px"},el("span",{class:"mut"},"Comparer avec "),sel),
+    !B.n?el("p",{class:"mut"},`${P[S.cmp].name} n'a pas de partie analysée au poste ${POS[pos]} sur cette période.`):el("div",{class:"tw"},el("table",{},
+      el("tr",{},el("th",{style:"text-align:left"},`${POS[pos]}, ${monthName(S.month).toLowerCase()}`),el("th",{},`${P[pu].name} (${A.n})`),el("th",{},`${P[S.cmp].name} (${B.n})`)),
+      R.map(([lab,k,dir,d,u=""])=>{ const a=A[k],b=B[k], win=a!=null&&b!=null&&Math.abs(a-b)>1e-6?((a-b)*dir>0?"a":"b"):null;
+        return el("tr",{},el("td",{style:"text-align:left"},lab),el("td",{class:win==="a"?"win":""},a!=null?(k==="gd15"&&a>0?"+":"")+fmt(a,d)+u:"–"),el("td",{class:win==="b"?"win":""},b!=null?(k==="gd15"&&b>0?"+":"")+fmt(b,d)+u:"–")); }))));
+  if(B.n){ const gap=R.filter(([,k,dir])=>A[k]!=null&&B[k]!=null&&(B[k]-A[k])*dir>0).map(([lab,k,dir])=>({lab,k,rel:Math.abs(B[k]-A[k])/Math.max(1e-6,Math.abs(B[k])||1)})).sort((x,y)=>y.rel-x.rel)[0];
+    if(gap) box.append(el("p",{class:"callout"},`Là où ${P[S.cmp].name} fait mieux que toi : `,el("b",{},gap.lab.toLowerCase()),`. Regardez une de ses parties ensemble pour voir comment il ou elle s'y prend.`)); }
+  const champs=u=>{ const c={}; for(const x of coachData(u,S.month,null)){ const r=(c[x.p.champ]??={n:0,s:0,w:0}); r.n++; r.s+=x.p.score; r.w+=x.p.win?1:0; } return c; };
+  const ca=champs(pu), cb=champs(S.cmp), both=Object.keys(ca).filter(k=>cb[k]);
+  if(both.length) box.append(el("ul",{class:"tips"},both.slice(0,3).map(k=>el("li",{},el("span",{class:"ci"},champImg(k)),` Sur ${k} : toi ${fmt(ca[k].s/ca[k].n,1)} de note (${pl(ca[k].n,"partie","parties")}), ${P[S.cmp].name} ${fmt(cb[k].s/cb[k].n,1)} (${pl(cb[k].n,"partie","parties")}).`))));
+  return box;
+}
+
+/* ---------- conseils de matchup (onglet En game) ---------- */
+function matchupNotes(x,g){
+  const foes=g.parts.filter(o=>o.team!==x.team&&o.champ).map(o=>o.champ), out=[];
+  const lane={}; for(const gm of [...D.games,...(D.casual||[])]){ const f=gm.review?.friends?.find(z=>z.puuid===x.puuid); if(f&&f.opp&&foes.includes(f.opp)){ const p=gm.parts.find(z=>z.pid===f.pid); const r=(lane[f.opp]??={n:0,w:0,gd:[],cs:[]}); r.n++; r.w+=p.win?1:0; if(f.gd15!=null) r.gd.push(f.gd15); if(f.cs10!=null&&f.csOpp10!=null) r.cs.push(f.cs10-f.csOpp10); } }
+  const avg=a=>a.length?a.reduce((s,v)=>s+v,0)/a.length:null;
+  const L=Object.entries(lane).sort((a,b)=>b[1].n-a[1].n);
+  if(L.length){ const [c,r]=L[0], gd=avg(r.gd), cs=avg(r.cs);
+    out.push([`Contre ${c} en lane : ${pl(r.n,"partie","parties")}, ${fmt(r.w/r.n*100)} % de victoires`,gd!=null?`, ${gd>0?"+":""}${fmt(gd)} or à 15 min en moyenne`:"",cs!=null?`, ${cs>0?"+":""}${fmt(cs)} CS à 10 min`:"","."]);
+    if(gd!=null&&gd<=-500) out.push("Lane souvent difficile pour toi : joue près de ta tour jusqu'à ton premier objet et préviens ton jungler.");
+    else if(gd!=null&&gd>=500) out.push("Un matchup que tu domines d'habitude : mets la pression tôt et prends les plaques.");
+  }
+  const vs={}; for(const gm of D.games){ const me=gm.parts.find(z=>z.puuid===x.puuid); if(!me) continue; for(const o of gm.parts) if(o.team!==me.team&&foes.includes(o.champ)&&!lane[o.champ]){ const r=(vs[o.champ]??={n:0,w:0}); r.n++; r.w+=me.win?1:0; } }
+  const V=Object.entries(vs).filter(([,r])=>r.n>=2).sort((a,b)=>(a[1].w/a[1].n)-(b[1].w/b[1].n));
+  if(V.length&&V[0][1].w/V[0][1].n<=.4) out.push(`Méfiance : quand ${V[0][0]} est en face, tu gagnes ${fmt(V[0][1].w/V[0][1].n*100)} % de tes parties (${V[0][1].n}).`);
+  return out;
+}
+
+/* ---------- paris entre potes ---------- */
+function betsBlock(){
+  const B=D.paris;
+  const box=el("div",{},el("h2",{style:"margin-top:28px"},"Paris entre potes"));
+  if(!B){ box.append(el("p",{class:"mut"},"Les paris se font sur Discord : quand un pote lance une partie, un bot poste un message, et chacun vote ✅ victoire ou ❌ défaite. Pour l'activer, il faut créer un bot Discord (le guide est dans le fichier GUIDE-PARIS.txt).")); return box; }
+  box.append(el("p",{class:"lead"},"Sur Discord, réagis ✅ ou ❌ au message du bot. Les paris ferment à la mise à jour suivante (environ 10 min), puis le résultat tombe à la fin de la partie."));
+  if(B.open.length) box.append(el("div",{class:"table"},B.open.map(o=>el("div",{class:"bet"},el("span",{class:"dot"+(o.locked?"":" on")}),
+    el("div",{},el("b",{},o.names.join(" et ")),el("div",{class:"mut",style:"font-size:13px"},`${o.mode}, ${o.locked?`paris fermés (${pl(o.votes,"vote","votes")}), en attente du résultat`:"paris ouverts sur Discord"}`))))));
+  if(B.scores.length) box.append(el("div",{class:"qtitle"},"Classement des pronostiqueurs"),el("div",{class:"tw"},el("table",{},
+    el("tr",{},el("th",{style:"text-align:left"},"Pronostiqueur"),el("th",{},"Bons pronos"),el("th",{},"Réussite"),el("th",{},"Série"),el("th",{},"Record")),
+    B.scores.map((s,i)=>el("tr",{},el("td",{style:"text-align:left;white-space:nowrap"},el("span",{class:"num mut"},`${i+1}. `),el("b",{},s.n)),el("td",{},`${s.ok}/${s.tot}`),
+      el("td",{class:s.ok/s.tot>=.5?"win":"loss"},fmt(s.ok/Math.max(1,s.tot)*100)+" %"),el("td",{},s.serie?`${s.serie} 🔥`:"0"),el("td",{},s.best))))));
+  if(B.recent.length) box.append(el("div",{class:"qtitle"},"Derniers paris"),el("div",{class:"table"},B.recent.map(r=>el("div",{class:"bet"},
+    el("span",{class:"res "+(r.res==="win"?"win":"loss"),style:"min-width:74px"},r.res==="win"?"Victoire":"Défaite"),
+    el("div",{},el("b",{},r.names.join(" et ")),el("div",{class:"mut",style:"font-size:13px"},`${new Date(r.date).toLocaleDateString("fr-FR",{weekday:"short",day:"numeric",month:"short"})}, ${r.yes} ✅ et ${r.votes-r.yes} ❌. `,r.good.length?`Bien vu : ${r.good.join(", ")}.`:"Personne n'avait vu juste."))))));
+  return box;
 }
 
 /* ---------- graphiques : outils SVG ---------- */
@@ -2635,8 +3122,9 @@ function liveFriendNotes(x,g){
   if(games.length){ const w=games.filter(p=>p.win).length; out.push(`${pl(games.length,"partie","parties")} sur ${x.champ} : ${fmt(w/games.length*100)} % de victoires, note moyenne ${fmt(games.reduce((a,p)=>a+p.score,0)/games.length,1)}`); }
   else out.push(`Première partie de ${x.champ} sur le site.`);
   const L=coachData(x.puuid,"all",null).slice(-10), cnt={}; for(const c of L) for(const k of c.m.keys||[]) cnt[k]=(cnt[k]||0)+1;
+  out.push(...matchupNotes(x,g));
   const top=Object.entries(cnt).sort((a,b)=>b[1]-a[1])[0];
-  if(top&&CKEY[top[0]]){ const d=L.slice().reverse().find(c=>c.m.keys.includes(top[0])).c.drill; out.push(["Rappel du coach : ",el("b",{},CKEY[top[0]][0].toLowerCase()),`. ${d.replace(/^Prochaine partie : /,"")}`]); }
+  if(top&&CKEY[top[0]]){ const w=L.slice().reverse().map(c=>c.c.work.find(x=>x.key===top[0])).find(Boolean); out.push(["Rappel du coach : ",el("b",{},CKEY[top[0]][0].toLowerCase()),w?`. ${w.detail}`:"."]); }
   return out;
 }
 function liveRow(x,g){
@@ -2675,8 +3163,45 @@ function liveCard(g){
 function liveTab(m){
   const L=liveGames();
   m.append(el("h2",{},"En game"),el("p",{class:"lead"},"La partie en cours de tes potes : la draft, les bans, les sorts, les runes, le rang et la maîtrise de chaque joueur. Le site se met à jour toutes les 10 minutes environ, la partie peut donc avoir commencé un peu avant d'apparaître."));
-  if(!L.length){ m.append(el("p",{class:"empty-state"},"Personne n'est en game en ce moment.")); return; }
-  m.append(...L.map(liveCard));
+  if(!L.length) m.append(el("p",{class:"empty-state"},"Personne n'est en game en ce moment."));
+  m.append(...L.map(liveCard),betsBlock());
+}
+
+/* ---------- onglet Normales & ARAM (hors classement ranked) ---------- */
+function casualTab(m){
+  S.cq=S.cq||"norm";
+  const lab={norm:"Normales",aram:"ARAM"}[S.cq];
+  const list=(D.casual||[]).filter(g=>g.q===S.cq&&(S.month==="all"||g.month===S.month)&&g.parts.some(isF));
+  m.append(el("h2",{},"Normales et ARAM"),el("p",{class:"lead"},`${monthName(S.month)}. Ces parties ne comptent ni dans le classement ranked, ni dans les points du mois : c'est juste pour le fun${S.cq==="aram"?". En ARAM, la note ne tient pas compte du farm ni de la vision":""}.`),
+    el("div",{class:"chips"},[["norm","Normales"],["aram","ARAM"]].map(([v,n])=>el("button",{"aria-pressed":S.cq===v?"true":"false",onclick:()=>{S.cq=v; render();}},n))));
+  if(!list.length){ m.append(el("p",{class:"empty-state"},`Aucune partie ${S.cq==="aram"?"ARAM":"normale"} sur cette période.`)); return; }
+  // classement
+  const A={}; for(const g of list) for(const p of g.parts) if(isF(p)){ const a=(A[p.puuid]??={pu:p.puuid,n:0,w:0,k:0,d:0,as:0,sc:0,dmg:0,min:0,ch:{}}); a.n++; a.w+=p.win?1:0; a.k+=p.k; a.d+=p.d; a.as+=p.a; a.sc+=p.score; a.dmg+=p.dmg; a.min+=g.dur/60; const c=(a.ch[p.champ]??={n:0,w:0}); c.n++; c.w+=p.win?1:0; }
+  const rows=Object.values(A).sort((a,b)=>((b.n>=3)-(a.n>=3))||(b.sc/b.n-a.sc/a.n));
+  m.append(el("div",{class:"qtitle"},S.cq==="aram"?"Classement ARAM":"Classement des normales"),el("div",{class:"tw"},el("table",{},
+    el("tr",{},el("th",{},"Joueur"),el("th",{},"Parties"),el("th",{},"Victoires"),el("th",{},"Note"),el("th",{},"KDA"),el("th",{style:"text-align:left"},"Champion favori")),
+    rows.map((a,i)=>{ const fav=Object.entries(a.ch).sort((x,y)=>y[1].n-x[1].n||y[1].w-x[1].w)[0];
+      return el("tr",{style:"cursor:pointer",onclick:()=>openProfile(a.pu)},el("td",{style:"white-space:nowrap;text-align:left"},el("span",{class:"num mut"},`${i+1}. `),el("b",{},P[a.pu].name)),
+        el("td",{},a.n),el("td",{class:a.w/a.n>=.5?"win":"loss"},fmt(a.w/a.n*100)+" %"),el("td",{},el("b",{},fmt(a.sc/a.n,1))),el("td",{},fmt((a.k+a.as)/Math.max(1,a.d),2)),
+        el("td",{style:"text-align:left"},el("span",{class:"p"},champImg(fav[0])," ",fav[0],el("span",{class:"mut"},` (${fav[1].n})`)))); }))));
+  // records
+  const R=[]; for(const g of list) for(const p of g.parts) if(isF(p)) R.push({g,p,kda:(p.k+p.a)/Math.max(1,p.d)});
+  const best=(f,dir=1,flt=()=>true)=>R.filter(flt).sort((a,b)=>(f(b)-f(a))*dir)[0];
+  const multi=r=>r.p.penta?"Pentakill":r.p.quadra?"Quadrakill":r.p.triple?"Triplé":null;
+  const recs=[["Plus de kills",best(r=>r.p.k),r=>r.p.k,r=>`${r.p.k}/${r.p.d}/${r.p.a}`],["Plus de dégâts",best(r=>r.p.dmg),r=>fmt(r.p.dmg),()=>"dégâts aux champions"],
+    ["Meilleure note",best(r=>r.p.score),r=>fmt(r.p.score,1),r=>`${r.p.k}/${r.p.d}/${r.p.a}`],["Meilleur KDA",best(r=>r.kda),r=>fmt(r.kda,1),r=>`${r.p.k}/${r.p.d}/${r.p.a}`],
+    S.cq==="aram"?["Plus d'assistances",best(r=>r.p.a),r=>r.p.a,()=>"assistances"]:["Meilleur farm",best(r=>r.p.cs/(r.g.dur/60),1,r=>r.p.pos!=="UTILITY"),r=>fmt(r.p.cs/(r.g.dur/60),1),()=>"CS par minute"],
+    ["Plus gros multikill",best(r=>(r.p.penta?5:r.p.quadra?4:r.p.triple?3:0),1,r=>multi(r)),r=>multi(r),r=>`${r.p.k}/${r.p.d}/${r.p.a}`],
+    ["Plus de morts",best(r=>r.p.d),r=>r.p.d,r=>`${r.p.k}/${r.p.d}/${r.p.a}`]];
+  m.append(el("div",{class:"qtitle"},"Records"),el("div",{class:"table"},recs.filter(r=>r[1]).map(([t,r,v,s])=>el("button",{class:"rec",onclick:()=>openReview(r.g)},
+    el("div",{class:"t"},t),el("div",{class:"big"},v(r)),el("div",{class:"by"},champImg(r.p.champ),el("b",{},r.p.name),el("span",{},s(r)),el("span",{},new Date(r.g.date).toLocaleDateString("fr-FR",{day:"numeric",month:"short"})))))));
+  // parties
+  m.append(el("div",{class:"qtitle"},`Dernières parties (${list.length})`),el("div",{class:"table"},list.slice(0,30).map(g=>{ const fs=g.parts.filter(p=>isF(p)); const win=fs[0]?.win;
+    return el("button",{class:"game",onclick:()=>openReview(g)},el("div",{class:"bar",style:`background:${win?"var(--teal)":"var(--red)"}`}),
+      el("div",{},el("div",{class:"meta"},el("span",{},new Date(g.date).toLocaleString("fr-FR",{weekday:"short",day:"numeric",month:"short",hour:"2-digit",minute:"2-digit"})),
+          el("span",{},`${Math.floor(g.dur/60)} min`),g.review?el("span",{class:"gold"},"revue disponible"):null),
+        el("div",{class:"ppl"},fs.map(p=>el("span",{class:"p"},champImg(p.champ),el("b",{},p.name),el("span",{class:"num"},`${p.k}/${p.d}/${p.a}`))))),
+      el("div",{class:`res ${win?"win":"loss"}`},win?"Victoire":"Défaite")); })));
 }
 
 /* ---------- matchups ---------- */
@@ -2819,7 +3344,7 @@ function openProfile(pu){
      A.games?el("div",{class:"tiles"},tiles.map(([v,l])=>el("div",{class:"tile"},el("b",{},v),el("span",{},l)))):el("p",{class:"mut"},"Aucune partie sur cette période."),
      (()=>{ const pal=palmares(pu); if(!pal.length) return null; const cnt={}; for(const t of pal) (cnt[t.n]??={...t,c:0,months:[]}).c++, cnt[t.n].months.push(monthName(t.mo).split(" ")[0]+" ("+QN[t.q].toLowerCase()+")");
        return [el("h4",{},`Palmarès : ${pal.length} trophée${pal.length>1?"s":""}`),el("div",{class:"palm"},Object.values(cnt).sort((a,b)=>b.c-a.c).map(t=>el("span",{class:"c-"+t.type,title:t.months.join(", ")},`${t.e} ${t.n}`,t.c>1?el("b",{},` ×${t.c}`):null)))]; })(),
-     A.games?[el("h4",{},"Bilan du coach"),coachSummary(pu,S.month,null)]:null,
+     A.games?[el("h4",{},"Bilan du coach"),defiBlock(pu,true),coachSummary(pu,S.month,null)]:null,
      A.games?[el("h4",{},"Style de jeu"),radarBlock(pu)]:null,
      trend.length>1?[el("h4",{},"Note moyenne par mois"),el("div",{class:"bars"},trend.map(({mo,a})=>el("div",{},el("b",{},fmt(a.note,1)),el("i",{style:`height:${Math.max(4,a.note/maxN*70)}px`}),el("span",{},(()=>{const [y,mm]=mo.split("-").map(Number); return new Date(y,mm-1,1).toLocaleString("fr-FR",{month:"short"});})())) ))]:null,
      champs.length?[el("h4",{},"Champions"),el("div",{class:"tw"},el("table",{},el("tr",{},el("th",{},"Champion"),el("th",{},"Parties"),el("th",{},"Victoires %"),el("th",{},"KDA")),
@@ -2941,6 +3466,14 @@ def main():
                 for x in gm["parts"] + gm["bans"]:
                     x.setdefault("champ", names.get(x.get("champId")))
         data["live"] = list(LIVE_GAMES.values())
+        data["missing"] = MISSING
+        bot, salon = os.environ.get("DISCORD_BOT_TOKEN", ""), str(cfg.get("paris_salon", "")).strip()
+        if demo:
+            data["paris"] = demo_bets()
+        elif bot and salon:
+            data["paris"] = run_bets(cfg, data["live"], data["players"], bot, salon, cfg["serveur"])
+        elif os.path.exists(os.path.join(CACHE, "paris.json")):
+            data["paris"] = bets_summary(json.load(open(os.path.join(CACHE, "paris.json"), encoding="utf-8")))
         data.update(structures_payload(cfg, players))
         for p in data["players"]:
             p["structs"] = next((x.get("structs", []) for x in players if x["puuid"] == p["puuid"]), [])
