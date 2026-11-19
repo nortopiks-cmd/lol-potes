@@ -16,10 +16,25 @@
     "Shutay#Krd",
     "Lucass#3551",
     "Stormeure#EUW",
-    "grrrr#grou"
+    "grrrr#grou",
+    "kracala#EUW"
   ],
   "mois": 3,
   "max_parties_par_joueur": 300,
   "revues_max": 150,
-  "min_parties_classement": 3
+  "min_parties_classement": 3,
+  "structures": [],
+  "matchs": [],
+  "duels": [],
+  "points": {
+    "victoire": 3,
+    "defaite": 1,
+    "bonne_partie": 1,
+    "partie_parfaite": 2,
+    "quadra": 2,
+    "penta": 5,
+    "max_parties_par_jour": 8,
+    "membres_comptes": 10
+  },
+  "paris_salon": "1573017692569468969"
 }
